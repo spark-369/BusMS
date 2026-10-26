@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { authMiddleware } from '@/middleware/auth';
+import { enforceRateLimit } from '@/lib/rateLimiter';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -13,7 +14,15 @@ export async function GET(req) {
     return authResult;
   }
 
+  // Audit queries scan a large, ever-growing table, so they are capped
+  // separately from ordinary reads.
+  const limited = await enforceRateLimit(req, 'ACTIVITY_LOGS', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { searchParams } = new URL(req.url);
     const userId = searchParams.get('userId');
     const action = searchParams.get('action');

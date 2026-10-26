@@ -1,6 +1,15 @@
 import { NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { authMiddleware } from '@/middleware/auth';
+import { enforceRateLimit } from '@/lib/rateLimiter';
+import { enqueueNotification } from '@/lib/enqueue';
+import {
+  cacheHeaders,
+  CACHE_NAMESPACES,
+  invalidate,
+  searchParamsKey,
+  withCache,
+} from '@/lib/cache';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -13,30 +22,43 @@ export async function GET(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_READ', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
-    const { searchParams } = new URL(req.url);
-    const routeId = searchParams.get('routeId');
+    const result = await withCache(
+      CACHE_NAMESPACES.STOPS,
+      searchParamsKey(req),
+      async () => {
+        const { searchParams } = new URL(req.url);
+        const routeId = searchParams.get('routeId');
 
-    const where = {};
-    if (routeId) where.routeId = routeId;
+        const where = {};
+        if (routeId) where.routeId = routeId;
 
-    const stops = await prisma.stop.findMany({
-      where,
-      include: {
-        route: {
-          select: {
-            id: true,
-            name: true,
+        const stops = await prisma.stop.findMany({
+          where,
+          include: {
+            route: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
           },
-        },
-      },
-      orderBy: [
-        { routeId: 'asc' },
-        { order: 'asc' },
-      ],
-    });
+          orderBy: [
+            { routeId: 'asc' },
+            { order: 'asc' },
+          ],
+        });
 
-    return NextResponse.json({ stops });
+        return { stops };
+      },
+    );
+
+    return NextResponse.json(result.data, { headers: cacheHeaders(result) });
   } catch (error) {
     console.error('Get stops error:', error);
     return NextResponse.json(
@@ -54,7 +76,13 @@ export async function POST(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { name, latitude, longitude, address, order, routeId } = await req.json();
 
     if (!name || latitude === undefined || longitude === undefined || !routeId) {
@@ -117,20 +145,22 @@ export async function POST(req) {
     });
 
     // Notify passengers about new stop
-    await prisma.notification.create({
-      data: {
-        userRole: "PASSENGER",
-        type: "SCHEDULE_CHANGE",
-        title: "New Stop Added",
-        message: `New stop "${name}" added to route "${route?.name || 'Unknown'}"`,
-        link: "/stops",
-      }
+    await enqueueNotification({
+      userRole: "PASSENGER",
+      type: "SCHEDULE_CHANGE",
+      title: "New Stop Added",
+      message: `New stop "${name}" added to route "${route?.name || 'Unknown'}"`,
+      link: "/stops",
     });
+
+    // A new stop changes the stop list and the route detail (which embeds stops).
+    await invalidate(CACHE_NAMESPACES.STOPS, CACHE_NAMESPACES.ROUTES);
 
     return NextResponse.json({
       message: 'Stop created successfully',
       stop,
     }, { status: 201 });
+
   } catch (error) {
     console.error('Create stop error:', error);
     return NextResponse.json(

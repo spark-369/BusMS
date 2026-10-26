@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
 import { Button, Input, Select, Alert } from "@/components/ui";
+import { useRateLimit } from "@/hooks/useRateLimit";
 
 export default function RegisterPage() {
   const router = useRouter();
@@ -20,6 +21,9 @@ export default function RegisterPage() {
     licenseNumber: "",
   });
   const [validationError, setValidationError] = useState("");
+  const [rateLimitMessage, setRateLimitMessage] = useState("");
+
+  const limiter = useRateLimit("register");
 
   const handleChange = (e) => {
     setFormData({
@@ -31,6 +35,7 @@ export default function RegisterPage() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     setValidationError("");
+    setRateLimitMessage("");
 
     if (formData.password !== formData.confirmPassword) {
       setValidationError("Passwords do not match");
@@ -39,6 +44,15 @@ export default function RegisterPage() {
 
     if (formData.password.length < 6) {
       setValidationError("Password must be at least 6 characters");
+      return;
+    }
+
+    // Pre-flight check only: the axios interceptor is the single place that
+    // consumes a local token, so we peek here (`consumeToken: false`) to render
+    // an immediate message without double-counting the attempt.
+    const verdict = limiter.guard({ consumeToken: false });
+    if (!verdict.allowed) {
+      setRateLimitMessage(verdict.message);
       return;
     }
 
@@ -60,11 +74,26 @@ export default function RegisterPage() {
       }
 
       await register(userData);
+      limiter.reset();
       router.push("/dashboard");
     } catch (err) {
+      // A rejection raised by the local limiter (axios request interceptor).
+      if (err?.isClientRateLimited) {
+        setRateLimitMessage(err.message);
+        return;
+      }
+
+      if (limiter.handleError(err)) {
+        setRateLimitMessage(
+          err.response?.data?.error ||
+            `Too many registration attempts. Please wait ${limiter.waitLabel || "a moment"}.`,
+        );
+        return;
+      }
       // Error is handled by AuthContext
     }
   };
+
 
   const roleOptions = [
     { value: "PASSENGER", label: "Passenger" },
@@ -85,9 +114,16 @@ export default function RegisterPage() {
         </div>
 
         <div className="rounded-2xl bg-slate-900 p-8 shadow-2xl ring-1 ring-slate-800">
-          {(error || validationError) && (
+          {((error && !rateLimitMessage) || validationError) && (
             <Alert variant="danger" className="mb-4">
-              {error || validationError}
+              {validationError || error}
+            </Alert>
+          )}
+
+          {(rateLimitMessage || limiter.isLimited) && (
+            <Alert variant="warning" className="mb-4">
+              {rateLimitMessage ||
+                `Too many attempts. Please wait ${limiter.waitLabel} before trying again.`}
             </Alert>
           )}
 
@@ -179,8 +215,9 @@ export default function RegisterPage() {
               variant="primary"
               className="w-full"
               loading={loading}
+              disabled={limiter.isLimited}
             >
-              Register
+              {limiter.isLimited ? `Try again in ${limiter.waitLabel}` : "Register"}
             </Button>
           </form>
 

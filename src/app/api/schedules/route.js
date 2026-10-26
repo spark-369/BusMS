@@ -2,6 +2,15 @@ import { NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { authMiddleware } from '@/middleware/auth';
 import { logActivity } from '@/lib/activityLogger';
+import { enforceRateLimit } from '@/lib/rateLimiter';
+import { enqueueNotification } from '@/lib/enqueue';
+import {
+  cacheHeaders,
+  CACHE_NAMESPACES,
+  invalidate,
+  searchParamsKey,
+  withCache,
+} from '@/lib/cache';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,44 +23,57 @@ export async function GET(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_READ', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
-    const { searchParams } = new URL(req.url);
-    const routeId = searchParams.get('routeId');
-    const busId = searchParams.get('busId');
-    const scheduleType = searchParams.get('scheduleType');
-    const isActive = searchParams.get('isActive');
-    const isSpecial = searchParams.get('isSpecial');
+    const result = await withCache(
+      CACHE_NAMESPACES.SCHEDULES,
+      searchParamsKey(req),
+      async () => {
+        const { searchParams } = new URL(req.url);
+        const routeId = searchParams.get('routeId');
+        const busId = searchParams.get('busId');
+        const scheduleType = searchParams.get('scheduleType');
+        const isActive = searchParams.get('isActive');
+        const isSpecial = searchParams.get('isSpecial');
 
-    const where = {};
-    if (routeId) where.routeId = routeId;
-    if (busId) where.busId = busId;
-    if (scheduleType) where.scheduleType = scheduleType;
-    if (isActive !== null) where.isActive = isActive === 'true';
-    if (isSpecial !== null) where.isSpecial = isSpecial === 'true';
+        const where = {};
+        if (routeId) where.routeId = routeId;
+        if (busId) where.busId = busId;
+        if (scheduleType) where.scheduleType = scheduleType;
+        if (isActive !== null) where.isActive = isActive === 'true';
+        if (isSpecial !== null) where.isSpecial = isSpecial === 'true';
 
-    const schedules = await prisma.schedule.findMany({
-      where,
-      include: {
-        route: {
-          select: {
-            id: true,
-            name: true,
+        const schedules = await prisma.schedule.findMany({
+          where,
+          include: {
+            route: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+            bus: {
+              select: {
+                id: true,
+                busNumber: true,
+                plateNumber: true,
+              },
+            },
           },
-        },
-        bus: {
-          select: {
-            id: true,
-            busNumber: true,
-            plateNumber: true,
+          orderBy: {
+            departureTime: 'asc',
           },
-        },
-      },
-      orderBy: {
-        departureTime: 'asc',
-      },
-    });
+        });
 
-    return NextResponse.json({ schedules });
+        return { schedules };
+      },
+    );
+
+    return NextResponse.json(result.data, { headers: cacheHeaders(result) });
   } catch (error) {
     console.error('Get schedules error:', error);
     return NextResponse.json(
@@ -69,7 +91,13 @@ export async function POST(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { routeId, busId, scheduleType, departureTime, arrivalTime, daysOfWeek, isSpecial, specialDate, notes, stopTimes } = await req.json();
 
     // Map frontend schedule type to Prisma enum
@@ -147,14 +175,12 @@ export async function POST(req) {
     });
 
     // Notify passengers about new schedule
-    await prisma.notification.create({
-      data: {
-        userRole: "PASSENGER",
-        type: "SCHEDULE_CHANGE",
-        title: "New Schedule Available",
-        message: `New ${scheduleType} schedule for route "${route.name}" - Departure: ${departureTime}`,
-        link: "/schedules",
-      }
+    await enqueueNotification({
+      userRole: "PASSENGER",
+      type: "SCHEDULE_CHANGE",
+      title: "New Schedule Available",
+      message: `New ${scheduleType} schedule for route "${route.name}" - Departure: ${departureTime}`,
+      link: "/schedules",
     });
 
     await logActivity({
@@ -164,7 +190,15 @@ export async function POST(req) {
       req,
     });
 
+    // Schedules are embedded in the bus list/detail and counted on the dashboard.
+    await invalidate(
+      CACHE_NAMESPACES.SCHEDULES,
+      CACHE_NAMESPACES.BUSES,
+      CACHE_NAMESPACES.DASHBOARD,
+    );
+
     return NextResponse.json({
+
       message: 'Schedule created successfully',
       schedule,
     }, { status: 201 });

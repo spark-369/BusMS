@@ -1,6 +1,15 @@
 import { NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { authMiddleware } from "@/middleware/auth";
+import { enforceRateLimit } from "@/lib/rateLimiter";
+import { enqueueNotification } from "@/lib/enqueue";
+import {
+  cacheHeaders,
+  CACHE_NAMESPACES,
+  invalidate,
+  searchParamsKey,
+  withCache,
+} from "@/lib/cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,54 +22,69 @@ export async function GET(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_READ", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
-    const { searchParams } = new URL(req.url);
-    const routeId = searchParams.get("routeId");
-    const busId = searchParams.get("busId");
-    const date = searchParams.get("date");
+    // Short TTL (15s): trips are the one collection that changes during the day
+    // as drivers start/complete them, and the UI polls this list.
+    const result = await withCache(
+      CACHE_NAMESPACES.TRIPS,
+      searchParamsKey(req),
+      async () => {
+        const { searchParams } = new URL(req.url);
+        const routeId = searchParams.get("routeId");
+        const busId = searchParams.get("busId");
+        const date = searchParams.get("date");
 
-    const where = {};
-    if (routeId) where.routeId = routeId;
-    if (busId) where.busId = busId;
-    if (date) {
-      where.startTime = {
-        gte: new Date(date),
-        lt: new Date(new Date(date).setDate(new Date(date).getDate() + 1)),
-      };
-    }
+        const where = {};
+        if (routeId) where.routeId = routeId;
+        if (busId) where.busId = busId;
+        if (date) {
+          where.startTime = {
+            gte: new Date(date),
+            lt: new Date(new Date(date).setDate(new Date(date).getDate() + 1)),
+          };
+        }
 
-    const trips = await prisma.trip.findMany({
-      where,
-      include: {
-        route: {
-          select: {
-            id: true,
-            name: true,
-            estimatedDuration: true,
+        const trips = await prisma.trip.findMany({
+          where,
+          include: {
+            route: {
+              select: {
+                id: true,
+                name: true,
+                estimatedDuration: true,
+              },
+            },
+            bus: {
+              select: {
+                id: true,
+                busNumber: true,
+                plateNumber: true,
+                capacity: true,
+              },
+            },
+            driver: {
+              select: {
+                id: true,
+                name: true,
+                licenseNumber: true,
+              },
+            },
           },
-        },
-        bus: {
-          select: {
-            id: true,
-            busNumber: true,
-            plateNumber: true,
-            capacity: true,
+          orderBy: {
+            startTime: "asc",
           },
-        },
-        driver: {
-          select: {
-            id: true,
-            name: true,
-            licenseNumber: true,
-          },
-        },
+        });
+
+        return { trips };
       },
-      orderBy: {
-        startTime: "asc",
-      },
-    });
+    );
 
-    return NextResponse.json({ trips });
+    return NextResponse.json(result.data, { headers: cacheHeaders(result) });
   } catch (error) {
     console.error("Get trips error:", error);
     return NextResponse.json(
@@ -78,7 +102,13 @@ export async function POST(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_WRITE", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const body = await req.json();
     const { scheduleId } = body;
 
@@ -160,15 +190,20 @@ export async function POST(req) {
     });
 
     // Notify passengers about new trip
-    await prisma.notification.create({
-      data: {
-        userRole: "PASSENGER",
-        type: "TRIP_SCHEDULED",
-        title: "New Trip Scheduled",
-        message: `New trip scheduled for route "${selectedRoute?.name || "Unknown"}" at ${new Date(departureTime).toLocaleTimeString()}`,
-        link: "/trips",
-      },
+    await enqueueNotification({
+      userRole: "PASSENGER",
+      type: "TRIP_SCHEDULED",
+      title: "New Trip Scheduled",
+      message: `New trip scheduled for route "${selectedRoute?.name || "Unknown"}" at ${new Date(departureTime).toLocaleTimeString()}`,
+      link: "/trips",
     });
+
+    // A new trip shifts the trip list and the dashboard/report counters.
+    await invalidate(
+      CACHE_NAMESPACES.TRIPS,
+      CACHE_NAMESPACES.DASHBOARD,
+      CACHE_NAMESPACES.REPORTS,
+    );
 
     return NextResponse.json(
       {

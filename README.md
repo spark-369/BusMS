@@ -1,4 +1,4 @@
-# University Bus Scheduling Management System
+# BusMS - University Bus Scheduling Management System
 
 A full-stack **Next.js 14** web application for managing university/campus bus
 transportation operations. It provides separate experiences for **Administrators**,
@@ -38,6 +38,9 @@ Prisma.
 - [How Attendance Works](#how-attendance-works)
 - [Notifications](#notifications)
 - [Security Notes](#security-notes)
+- [Redis, BullMQ & Rate Limiting](#redis-bullmq--rate-limiting)
+- [Testing](#testing)
+- [Docker](#docker)
 - [Getting Started](#getting-started)
 - [Environment Variables](#environment-variables)
 - [Available Scripts](#available-scripts)
@@ -228,11 +231,17 @@ my-app/
 │   │   ├── map/                  # MapView, LocationPicker (+ barrel)
 │   │   └── QRVerifier.js         # Camera QR scanner component
 │   ├── context/                  # AuthContext, AppContext
-│   ├── lib/                      # prisma client, activityLogger
+│   ├── hooks/                    # useRateLimit (live countdown UI state)
+│   ├── lib/                      # prisma, activityLogger, redis, cache, rateLimiter, queue, enqueue
+│   │   └── jobs/                 # BullMQ job handlers (*.jobs.mjs, Prisma injected)
 │   ├── middleware/               # authMiddleware, optionalAuth
 │   ├── services/                 # axios client + per-resource API services
-│   └── utils/                    # jwt helpers
-├── .env.example
+│   └── utils/                    # jwt helpers, clientRateLimit
+├── worker/                       # Standalone BullMQ worker (npm run worker)
+├── tests/                        # Vitest unit + end-to-end suites
+├── Dockerfile                    # Multi-stage image (web server + worker)
+├── .dockerignore
+├── .env
 ├── next.config.mjs
 ├── postcss.config.mjs
 ├── vercel.json
@@ -660,6 +669,13 @@ All paths are relative to `/api`. The **Auth** column lists permitted roles.
 | GET | `/dashboard` | Admin | Aggregate stats + recent trips + upcoming schedules + maintenance alerts. |
 | POST | `/dashboard` | Admin | Send an emergency broadcast to all roles. |
 
+#### Infrastructure
+
+| Method | Path | Auth | Description |
+| --- | --- | --- | --- |
+| GET | `/health/live` | Public | Liveness probe. Returns `{ status: 'ok' }`. No DB/Redis/auth work, so it cannot fail during a dependency outage. Used by the Docker `HEALTHCHECK`. |
+| GET | `/health` | Admin | Redis status, cache diagnostics, active rate-limit policies and queue depth (incl. `deliveryMode`). |
+
 ### Backend Business Logic
 
 **Booking creation (overbooking protection)** — `POST /api/bookings`
@@ -703,6 +719,45 @@ Attendance is driven entirely by **driver pass verification** (no manual marking
 5. **Reports → Daily Summary → Attendance Summary** displays Total / Present /
    Absent / Attendance Rate from that data.
 
+### The read and write paths must agree
+
+`Present` is only non-zero when the query used to *count* attendance matches the
+one used to *record* it. Three things have to line up:
+
+| | Write (`PUT /api/buspass`) | Read (`GET /api/reports?type=daily-summary`) |
+| --- | --- | --- |
+| Date field | `bookingDate` | `bookingDate` |
+| Window | `gte: startOfDay()`, `lt: startOfNextDay()` | `gte`/`lte` of `dayRange()` |
+| Status | `CONFIRMED`, `COMPLETED` | `CONFIRMED`, `COMPLETED` |
+| `isUsed` | filtered to `false`, then set `true` | counted where `true` |
+
+Two failure modes worth knowing about, both of which make attendance read as
+`0%` even though it was recorded:
+
+- **Filtering the report by `tripId`.** `Booking.tripId` is **optional** in the
+  schema, so a booking created without a trip is invisible to a
+  `tripId IN (…)` filter. The report now filters on `bookingDate` instead.
+- **A stale cache.** Recording attendance must call
+  `invalidate(CACHE_NAMESPACES.REPORTS)`, otherwise the 60s reports TTL keeps
+  serving the pre-verification numbers.
+
+### Date handling
+
+All day windows go through `src/utils/dates.js` rather than ad-hoc `Date`
+arithmetic, because two very common mistakes silently shift a window by a day:
+
+- `new Date('2026-02-16')` parses as **UTC** midnight, while `setHours(0,0,0,0)`
+  is **local**. Use `parseDateOnly()` to get local midnight for a date-only
+  string.
+- `date.toISOString().split('T')[0]` returns the **UTC** calendar date, which is
+  the previous day for local times earlier than the UTC offset. Use
+  `toLocalDateKey()`.
+
+Helpers available: `startOfDay`, `endOfDay`, `startOfNextDay`, `dayRange`,
+`toLocalDateKey`, `parseDateOnly`. Prefer an exclusive upper bound
+(`lt: startOfNextDay()`) over `lte: endOfDay()` so the final millisecond of a day
+is never excluded.
+
 
 ## Notifications
 
@@ -730,10 +785,399 @@ Attendance is driven entirely by **driver pass verification** (no manual marking
   address and user agent.
 - **Input validation**: all write endpoints validate required fields, enums, numeric
   ranges, dates and foreign-key existence before touching the database.
+- **Rate limiting**: every endpoint is protected by a manual, Redis-backed
+  limiter (see [Redis, BullMQ & Rate Limiting](#redis-bullmq--rate-limiting)).
+  Credential endpoints are capped per IP **and** per email.
 
+---
 
+## Redis, BullMQ & Rate Limiting
 
+Three optional, independent capabilities. **All three work without Redis** — the
+app degrades to per-process memory and inline execution, so nothing breaks if
+`REDIS_URL` is unset. This is deliberate: the target deployment is Vercel
+Hobby, which cannot host a long-lived worker process.
 
+| Concern | Redis present | Redis absent |
+| --- | --- | --- |
+| **Cache** (`src/lib/cache.js`) | Shared across instances, invalidated via version keys | Bounded in-process `Map` (500 entries) |
+| **Rate limiting** (`src/lib/rateLimiter.js`) | Distributed counters, shared across instances | Per-process counters |
+| **Jobs** (`src/lib/queue.js`) | Published to BullMQ; consumed by `worker/index.mjs` | Executed inline inside the request |
+
+### 1. Caching (`src/lib/cache.js`)
+
+Cache-aside reads for the heavy, read-mostly collections. Every entry lives at
+`bus:cache:<namespace>:<version>:<suffix>`.
+
+Invalidation uses a **per-namespace version counter**, not a key sweep: flushing
+a namespace is one atomic `INCR` on `bus:cachever:<namespace>`. Stale entries
+become unreachable instantly and expire on their own TTL, so there is never a
+`KEYS`/`SCAN` (which blocks Redis) and never an O(n) delete.
+
+```js
+import { withCache, CACHE_NAMESPACES, cacheHeaders, searchParamsKey } from '@/lib/cache';
+
+const result = await withCache(CACHE_NAMESPACES.BUSES, searchParamsKey(req), async () => {
+  return { buses: await prisma.bus.findMany() };
+});
+
+return NextResponse.json(result.data, { headers: cacheHeaders(result) });
+// -> X-Cache: HIT | MISS, X-Cache-Source: redis | memory
+```
+
+Namespaces and TTLs:
+
+| Namespace | TTL | Cached by |
+| --- | --- | --- |
+| `routes`, `stops`, `reports`, `maintenance` | 60s | query string |
+| `buses`, `schedules`, `dashboard`, `assignments` | 30s | query string / `admin` |
+| `trips` | 15s | query string |
+| `notifications` | 10s | **`<role>:<query>`** |
+
+> `notifications` **must** include the role in the key — the feed is
+> role-scoped, so omitting it would leak an admin's notifications to a
+> passenger. `trips`/`notifications` use short TTLs because the UI polls them.
+
+Every mutating handler calls `invalidate(...)` for the namespaces it affects
+(e.g. creating a schedule flushes `SCHEDULES`, `BUSES`, `DASHBOARD`).
+
+### 2. BullMQ message broker (`src/lib/queue.js` + `worker/index.mjs`)
+
+Two queues:
+
+| Queue | Jobs | Notes |
+| --- | --- | --- |
+| `notifications` | `notification.create`, `notification.broadcast`, `notification.emergency` | 5 attempts, exponential backoff |
+| `audit` | `audit.log` | 10-way concurrency |
+
+Route handlers call the `src/lib/enqueue.js` facade rather than touching queues:
+
+```js
+await enqueueNotification({ userRole: 'PASSENGER', type: 'ROUTE_CREATED', title, message, link });
+await enqueueBroadcast({ roles: ['ADMIN','DRIVER','PASSENGER'], type, title, message });
+await enqueueEmergencyBroadcast({ message, userId });
+```
+
+These never reject: a failed enqueue falls back to inline execution, because a
+notification is a side effect that must not fail the user's booking.
+
+**Start the worker** (required only when `REDIS_URL` is set):
+
+```bash
+npm run worker
+```
+
+Job handlers live in `src/lib/jobs/*.jobs.mjs` as plain ESM with **no imports** —
+Prisma is injected as `{ prisma }`. That lets the *same file* load in both the
+Next.js bundle (where `@/lib/prisma` resolves) and the standalone worker (plain
+Node, no bundler, no path aliases).
+
+> ⚠️ If `REDIS_URL` is set but no worker is running, jobs queue up and are never
+> written. `GET /api/health` reports `queue.deliveryMode` and
+> `queue.pendingJobs` so this misconfiguration is visible.
+
+### 3. Manual rate limiting
+
+No third-party limiter library — two algorithms are implemented directly with
+Redis Lua scripts, each mirrored by an in-process fallback.
+
+| Algorithm | Redis implementation | Trade-off |
+| --- | --- | --- |
+| `fixed` (default) | `INCR` + `PEXPIRE` in one Lua script | One round trip; a burst at a window boundary can reach 2x |
+| `sliding` | Sorted set trimmed by score, in one Lua script | Exact; stores one member per request |
+
+Lua is used rather than `MULTI`/`EXEC` because check-and-increment must be
+atomic — reading the counter in Node and writing it back is a TOCTOU race that
+lets concurrent requests overshoot the limit.
+
+**Identity** (`getRateLimitIdentity`): authenticated callers are keyed by user
+id, anonymous callers by IP (left-most `x-forwarded-for` hop). Keying logged-in
+users by id prevents one noisy user from exhausting the allowance of everyone
+behind the same campus NAT.
+
+**Policies** (`RATE_LIMITS`):
+
+| Policy | Limit | Window | Algorithm | Applied to |
+| --- | --- | --- | --- | --- |
+| `LOGIN` | 10 | 60s | sliding | per IP **and** per email |
+| `REGISTER` | 5 | 60s | sliding | per IP **and** per email |
+| `QR_VERIFY` | 60 | 60s | sliding | bus pass verification |
+| `BROADCAST` | 5 | 60s | fixed | emergency broadcast |
+| `REPORTS` | 30 | 60s | fixed | `/api/reports` |
+| `BOOKING_WRITE` | 20 | 60s | fixed | booking creation |
+| `BULK_WRITE` | 15 | 60s | fixed | bus passes |
+| `COLLECTION_WRITE` | 40 | 60s | fixed | generic CRUD writes |
+| `DASHBOARD` / `ACTIVITY_LOGS` | 60 | 60s | fixed | dashboard, audit trail |
+| `COLLECTION_READ` | 120 | 60s | fixed | generic CRUD reads |
+| `DEFAULT` | 100 | 60s | fixed | anything unlisted |
+
+Applying a limit in a handler:
+
+```js
+const limited = await enforceRateLimit(req, 'COLLECTION_READ', { user });
+if (limited) return limited;   // ready-made 429, or null when allowed
+```
+
+Rejections return `429` with `Retry-After`, `RateLimit-*` and `X-RateLimit-*`
+headers plus a JSON body `{ error, code: 'RATE_LIMITED', retryAfter, limit }`.
+
+**Failure policy is fail-open.** Rate limiting is a protection layer, not an
+authorization check — refusing all traffic because Redis blipped would turn a
+cache outage into a full outage. On Redis trouble the limiter degrades to
+in-process counters. A circuit breaker (`src/lib/redis.js`) skips Redis entirely
+for 30s after 3 consecutive failures so an outage never costs a connection
+timeout per request.
+
+### 4. Frontend rate limiting
+
+The server is always authoritative; the client layer exists to avoid *making* a
+doomed request. Two mechanisms, deliberately layered:
+
+1. **Local buckets** (`src/utils/clientRateLimit.js`) — a manual
+   sliding-window counter in `sessionStorage`, mirroring the server policies
+   (slightly tighter, so the client defers first). Stops double-clicks,
+   Enter-key spam and tight polling loops.
+2. **Server-signalled cooldown** (`applyServerRateLimit`) — when the API does
+   answer `429`, `Retry-After` is trusted and a hard cooldown is installed.
+   This is what actually keeps client and server in agreement, since the local
+   bucket cannot know about other tabs, devices, or clients behind the same IP.
+
+`services/client.js` wires both in: the request interceptor short-circuits
+known-limited actions, the response interceptor folds `429`s back into the
+cooldown.
+
+For live countdown UI use the hook:
+
+```jsx
+import { useRateLimit } from '@/hooks/useRateLimit';
+
+const limiter = useRateLimit('login');
+
+const onSubmit = async (e) => {
+  e.preventDefault();
+  const verdict = limiter.guard();          // consumes a local token
+  if (!verdict.allowed) return setError(verdict.message);
+
+  try {
+    await login(email, password);
+    limiter.reset();                        // clear on success
+  } catch (err) {
+    if (limiter.handleError(err)) return;   // installs cooldown from Retry-After
+    throw err;
+  }
+};
+
+// <Button disabled={limiter.isLimited}>
+//   {limiter.isLimited ? `Try again in ${limiter.waitLabel}` : 'Sign In'}
+// </Button>
+```
+
+The hook ticks once per second **only while blocked**, so idle pages run no
+timers. Implemented in the login and register pages; `CLIENT_LIMITS` covers
+`login`, `register`, `booking-create`, `feedback-submit`, `notification-send`,
+`broadcast`, `qr-verify`, `api-read`, `api-write`.
+
+### 5. Observability
+
+`GET /api/health` (admin only) reports Redis status, cache entry counts and
+namespace versions, active policies, and queue depth:
+
+```json
+{
+  "status": "ok",
+  "redis": { "configured": true, "status": "ready", "usable": true, "circuitOpenUntil": null },
+  "cache": { "entries": 12, "versions": { "buses": 3 } },
+  "rateLimiter": { "policies": ["LOGIN", "..."], "buckets": 4, "redisBacked": true },
+  "queue": { "configured": true, "deliveryMode": "brokered", "pendingJobs": 0, "workerRequired": true },
+  "audit": { "mode": "brokered" }
+}
+```
+
+### Running Redis locally
+
+```bash
+docker run -d --name bus-redis -p 6379:6379 redis:7-alpine
+# then, in two terminals:
+npm run dev
+npm run worker
+```
+
+To run entirely without Redis, leave `REDIS_URL` empty — the app is fully
+functional, just without shared caching, distributed limits or the queue.
+
+---
+
+## Testing
+
+Vitest, chosen over Jest because the queue layer and the worker are native ESM
+(`.mjs`); Vitest runs ESM natively, so those files are imported directly with no
+transform shims.
+
+```bash
+npm test              # run everything once
+npm run test:watch    # watch mode
+npm run test:unit     # tests/unit only
+npm run test:e2e      # tests/e2e only
+npm run test:coverage # v8 coverage -> ./coverage
+```
+
+**No infrastructure is required.** There is no Redis server, no database and no
+network access: the suites deliberately run against the documented degraded
+paths, and a test can opt into the Redis-backed paths via an in-memory double.
+
+### Layout
+
+```
+tests/
+├── setup.js                    # env defaults + per-test state isolation
+├── helpers/
+│   ├── fakeRedis.js            # in-memory Redis double (implements both Lua scripts)
+│   └── prismaMock.js           # Prisma double + user fixtures
+├── unit/
+│   ├── cache.test.js           # hit/miss, TTL, version-key invalidation
+│   ├── rateLimiter.test.js     # both algorithms, headers, fail-open
+│   ├── redis.test.js           # circuit breaker, Lua paths, Redis fallbacks
+│   ├── queue.test.js           # inline fallback (no Redis)
+│   ├── queueRedis.test.js      # enqueue timeout, queued mode, breaker pre-check
+│   ├── enqueue.test.js         # facade wiring end-to-end
+│   ├── jobs.test.js            # job handlers against an injected Prisma stub
+│   ├── dates.test.js           # local-day helpers + attendance arithmetic
+│   ├── prismaMockCoverage.test.js # the Prisma double covers every route usage
+│   └── clientRateLimit.test.js # browser limiter + cooldown (jsdom)
+└── e2e/
+    ├── auth.login.test.js      # real login handler: auth, per-IP + per-email 429
+    ├── cacheRoutes.test.js     # X-Cache MISS->HIT, invalidation, role isolation
+    ├── attendance.test.js      # attendance read/write path agreement
+    ├── health.test.js          # /api/health reporting (admin-only)
+    └── healthLive.test.js      # /api/health/live liveness probe
+```
+
+### Unit vs end-to-end
+
+The **unit** suites call the modules directly. The **e2e** suites drive the real
+route handlers over real `Request`/`NextResponse` objects, mocking *only*
+`@/lib/prisma`. That means routing, JWT verification, role checks, caching,
+rate limiting and queue dispatch all execute for real — only the database is
+stubbed, which keeps the tests fast and dependency-free.
+
+### Notable test design decisions
+
+- **The Redis double implements the Lua scripts**, rather than stubbing
+  `eval`. A stub returning canned values would let a broken script pass; this
+  double reproduces real counter/sorted-set semantics, so the assertions are
+  meaningful.
+- **`vi.hoisted` is required** in any file with a `vi.mock` factory. Factories
+  are hoisted above the file's imports, so a factory closing over a plain
+  module-scope `const` throws `Cannot access 'x' before initialization`. Where
+  the helper itself must be loaded, the factory uses
+  `await import('../helpers/...')` instead.
+- **`setup.js` never imports application modules.** It resets state through
+  hooks the modules register on `globalThis` (`__busCacheReset`,
+  `__busRateLimitReset`, `__busRedisReset`). Importing `@/lib/cache` there would
+  load `ioredis` before a test file's `vi.mock('ioredis')` could apply, so the
+  fake would be ignored. This is the reason those hooks exist.
+- **Process-global singletons are read through `globalThis`, not captured in
+  module-level `const`s.** The Redis circuit breaker originally kept a `const`
+  reference to the object it stored on `globalThis`; once tripped it could never
+  be reset, so a single failure silently disabled Redis for the whole process —
+  and leaked across tests. `resetRedisState()` is the supported reset.
+- **The Prisma double's surface is verified against the schema.** A
+  hand-maintained mock surface drifts silently: `busPass.findFirst` was once
+  omitted, so a test died with `Cannot read properties of undefined` — the
+  *double* was wrong, not the application. `prismaMockCoverage.test.js` now
+  asserts that every `model` in `prisma/schema.prisma` exists on the mock, that
+  each model exposes the full delegate API, and that every
+  `prisma.<model>.<method>` (and `tx.<model>.<method>`) actually used in a route
+  handler is present. Adding a model or a new call without extending the double
+  fails there, with a clear message, instead of surfacing as a confusing
+  TypeError in an unrelated test.
+- **`restoreMocks` is intentionally off** in `vitest.config.mjs`: it resets mocks
+  to their original implementation, which would wipe the Prisma double's default
+  behaviour. Isolation is handled explicitly instead.
+
+### Coverage focus
+
+The suite targets the failure modes that actually matter in production:
+behaviour when Redis is **absent**, when it **fails mid-request**, and when it is
+**configured but unreachable** (the enqueue-timeout case, which would otherwise
+hang every write). Cache **invalidation** and **role-scoped key isolation** are
+covered end-to-end because getting either wrong is a correctness or a security
+bug, not a performance one.
+
+---
+
+## Docker
+
+A single `Dockerfile` produces one image with two roles:
+
+| Role | Command |
+| --- | --- |
+| Web server | *(default)* `node server.js` |
+| BullMQ worker | `npm run worker` |
+
+Running the worker from the **same image** guarantees the API and the worker
+execute identical code and identical job handlers — which would not hold if they
+were built separately.
+
+### Build and run
+
+```bash
+docker build -t bus-scheduling .
+
+# Web server (env comes from .env, which is never baked into the image)
+docker run -p 3000:3000 --env-file .env bus-scheduling
+
+# Worker (second container, same image)
+docker run --env-file .env bus-scheduling npm run worker
+```
+
+With a Redis instance on the host, point the container at it:
+
+```bash
+docker run -p 3000:3000 --env-file .env \
+  -e REDIS_URL=redis://host.docker.internal:6379 bus-scheduling
+```
+
+### What the image does
+
+- **Multi-stage** (`deps` → `builder` → `runner`) so the slow dependency layer is
+  cached and not invalidated by source edits.
+- Uses Next.js `output: "standalone"`, so the runtime ships a minimal server plus
+  only the `node_modules` it needs, instead of the whole dependency tree.
+- Copies `bullmq`, `ioredis`, `@prisma` and `.prisma` on top of the standalone
+  bundle, because the standalone output prunes packages it thinks are unused and
+  the **worker needs them**.
+- Runs as a **non-root** user (`nextjs`, uid 1001).
+- Ships a `HEALTHCHECK` against the public `/api/health/live` endpoint (not
+  `/api/health`, which is admin-only and would return 401 to an unauthenticated
+  probe), using `127.0.0.1` rather than `localhost` to avoid resolving to `::1`
+  where the server binds IPv4 only.
+- `openssl` is installed in every stage because the Prisma query engine links
+  against it.
+
+### Prisma binary targets
+
+`prisma/schema.prisma` declares three targets:
+
+| Target | Needed by |
+| --- | --- |
+| `native` | local development |
+| `debian-openssl-3.0.x` | `node:20-bookworm-slim` (this Docker image) |
+| `rhel-openssl-3.0.x` | Vercel / Amazon Linux |
+
+Omitting the debian target produces a container that starts and then fails at the
+first query with "Query engine binary not found".
+
+### Secrets
+
+`.env` is listed in `.dockerignore`, so it is **never** copied into a layer.
+`DATABASE_URL` and `JWT_SECRET` are set to throwaway placeholders during the
+build only — `next build` needs a syntactically valid value to construct the
+Prisma client but never connects, and the real values are injected at runtime.
+
+> ⚠️ `NEXT_PUBLIC_API_URL` is inlined into the **client** bundle at build time.
+> Leave it empty (the default) so the browser calls the same origin; a runtime
+> `-e` override cannot change a value that was already compiled in.
 ## Getting Started
 
 ### Prerequisites
@@ -751,10 +1195,11 @@ cd my-app
 npm install
 ```
 
-2. Configure environment variables:
+2. Configure environment variables. The repo ships a working `.env`; edit the
+   values for your setup (`DATABASE_URL`, `JWT_SECRET`, optionally `REDIS_URL`):
 ```bash
-cp .env.example .env
-# Edit .env with your DATABASE_URL and JWT_SECRET
+# .env is already present and gitignored — no copy step needed.
+# For production, set the same keys in your host's environment.
 ```
 
 3. Set up the database:
@@ -770,6 +1215,13 @@ npm run dev
 
 5. Open [http://localhost:3000](http://localhost:3000)
 
+6. *(Optional)* Enable Redis, caching and the job queue:
+```bash
+docker run -d --name bus-redis -p 6379:6379 redis:7-alpine
+# set REDIS_URL="redis://localhost:6379" in .env, then in a second terminal:
+npm run worker
+```
+
 ## Environment Variables
 
 | Key | Required | Description |
@@ -778,12 +1230,23 @@ npm run dev
 | `JWT_SECRET` | Yes (prod) | Long random string (`openssl rand -base64 32`). The app throws in production without it. |
 | `JWT_EXPIRES_IN` | No | Token lifetime, e.g. `7d` (default `7d`). |
 | `NEXT_PUBLIC_API_URL` | No | Leave **empty** so browser requests use the same origin. Set only for an external API host. |
+| `REDIS_URL` | No | Redis connection string, e.g. `redis://localhost:6379`. **Leave empty to disable Redis entirely** — caching and rate limiting fall back to per-process memory and jobs run inline. Set it to enable the shared cache, distributed rate limits and the BullMQ worker. |
+| `CACHE_TTL_SECONDS` | No | Default cache TTL when a namespace has no specific TTL (default `60`). |
+| `CACHE_MEMORY_MAX_ENTRIES` | No | Max entries in the in-process cache fallback before eviction (default `500`). |
+| `REDIS_DEBUG` | No | `"true"` logs Redis connection/command failures to the console (default `false`). |
+| `RATE_LIMIT_LOG` | No | Reserved for rate-limit logging verbosity (default `warn`). |
 
 ## Available Scripts
 
 | Script | Description |
 | --- | --- |
 | `npm run dev` | Start the development server |
+| `npm run worker` | Start the BullMQ worker (`node worker/index.mjs`) — requires `REDIS_URL` |
+| `npm test` | Run the full Vitest suite (unit + e2e) |
+| `npm run test:watch` | Vitest in watch mode |
+| `npm run test:unit` | Unit suites only (`tests/unit`) |
+| `npm run test:e2e` | End-to-end route suites only (`tests/e2e`) |
+| `npm run test:coverage` | Vitest with v8 coverage → `./coverage` |
 | `npm run build` | `prisma generate && next build` |
 | `npm run start` | Start the production server |
 | `npm run lint` | Run ESLint (`next lint`) |
@@ -816,8 +1279,17 @@ In **Project → Settings → Environment Variables**, add (for Production, Prev
 | `JWT_SECRET` | A long random string, e.g. output of `openssl rand -base64 32`. **Required** — the app refuses to sign tokens in production without it. |
 | `JWT_EXPIRES_IN` | Optional, e.g. `7d`. |
 | `NEXT_PUBLIC_API_URL` | Leave **empty** so the browser calls the same origin. |
+| `REDIS_URL` | Optional. Leave **unset** to run without Redis (in-memory cache/limits, inline jobs). Set it to enable the shared cache and distributed rate limits — but see the worker note below. |
 
 > ⚠️ The default `DATABASE_URL` in `.env` points at `localhost` and will **not** work on Vercel. Always use a hosted database in production.
+
+> ⚠️ **If you set `REDIS_URL` on Vercel, run the worker too.** Serverless
+> functions cannot host a long-lived BullMQ worker, so notifications and audit
+> logs would queue up and never be written. Either deploy `worker/index.mjs` as a
+> separate long-lived service (Render/Railway/Fly.io — the `Dockerfile` in this
+> repo works as-is) or leave `REDIS_URL` unset, in which case jobs execute inline
+> and everything still works. Check `GET /api/health` for
+> `queue.deliveryMode` and `queue.pendingJobs`.
 
 ### 4. Deploy
 Vercel runs `prisma generate`, applies pending migrations (`prisma migrate deploy`) and builds. The build is statically lint-checked with `.eslintrc.json` (non-interactive).

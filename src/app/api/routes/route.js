@@ -2,6 +2,15 @@ import { NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { authMiddleware } from "@/middleware/auth";
 import { logActivity } from "@/lib/activityLogger";
+import { enforceRateLimit } from "@/lib/rateLimiter";
+import { enqueueNotification } from "@/lib/enqueue";
+import {
+  cacheHeaders,
+  CACHE_NAMESPACES,
+  invalidate,
+  searchParamsKey,
+  withCache,
+} from "@/lib/cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,37 +23,50 @@ export async function GET(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_READ", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
-    const { searchParams } = new URL(req.url);
-    const isActive = searchParams.get("isActive");
+    const result = await withCache(
+      CACHE_NAMESPACES.ROUTES,
+      searchParamsKey(req),
+      async () => {
+        const { searchParams } = new URL(req.url);
+        const isActive = searchParams.get("isActive");
 
-    const where = {};
+        const where = {};
 
-    if (isActive !== null) {
-      where.isActive = isActive === "true";
-    }
+        if (isActive !== null) {
+          where.isActive = isActive === "true";
+        }
 
-    const routes = await prisma.route.findMany({
-      where,
-      include: {
-        stops: {
+        const routes = await prisma.route.findMany({
+          where,
+          include: {
+            stops: {
+              orderBy: {
+                order: "asc",
+              },
+            },
+            _count: {
+              select: {
+                schedules: true,
+                trips: true,
+              },
+            },
+          },
           orderBy: {
-            order: "asc",
+            name: "asc",
           },
-        },
-        _count: {
-          select: {
-            schedules: true,
-            trips: true,
-          },
-        },
-      },
-      orderBy: {
-        name: "asc",
-      },
-    });
+        });
 
-    return NextResponse.json({ routes });
+        return { routes };
+      },
+    );
+
+    return NextResponse.json(result.data, { headers: cacheHeaders(result) });
   } catch (error) {
     console.error("Get routes error:", error);
     return NextResponse.json(
@@ -62,7 +84,13 @@ export async function POST(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_WRITE", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { name, description, estimatedDuration, distance, stops } =
       await req.json();
 
@@ -112,15 +140,14 @@ export async function POST(req) {
       },
     });
 
-    // Notify passengers about new route
-    await prisma.notification.create({
-      data: {
-        userRole: "PASSENGER",
-        type: "ROUTE_CREATED",
-        title: "New Route Available",
-        message: `New route "${name}" has been added. Distance: ${distance}km, Duration: ${estimatedDuration} mins`,
-        link: "/routes",
-      }
+    // Notify passengers about new route (brokered through BullMQ when Redis is
+    // configured; executed inline otherwise).
+    await enqueueNotification({
+      userRole: "PASSENGER",
+      type: "ROUTE_CREATED",
+      title: "New Route Available",
+      message: `New route "${name}" has been added. Distance: ${distance}km, Duration: ${estimatedDuration} mins`,
+      link: "/routes",
     });
 
     await logActivity({
@@ -129,6 +156,15 @@ export async function POST(req) {
       details: `Route "${route.name}" created`,
       req,
     });
+
+    // Stops belong to the route, and the dashboard/report counters include
+    // route totals.
+    await invalidate(
+      CACHE_NAMESPACES.ROUTES,
+      CACHE_NAMESPACES.STOPS,
+      CACHE_NAMESPACES.DASHBOARD,
+      CACHE_NAMESPACES.REPORTS,
+    );
 
     return NextResponse.json(
       {

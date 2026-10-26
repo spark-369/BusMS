@@ -2,6 +2,13 @@ import { NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { authMiddleware } from '@/middleware/auth';
 import { logActivity } from '@/lib/activityLogger';
+import { enforceRateLimit } from '@/lib/rateLimiter';
+import {
+  cacheHeaders,
+  CACHE_NAMESPACES,
+  invalidate,
+  withCache,
+} from '@/lib/cache';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -16,30 +23,39 @@ export async function GET(req, { params }) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_READ', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
-    const trip = await prisma.trip.findUnique({
-      where: { id },
-      include: {
-        route: true,
-        bus: true,
-        driver: {
-          select: {
-            name: true,
-            phone: true,
+    const result = await withCache(CACHE_NAMESPACES.TRIPS, `id:${id}`, async () => {
+      const trip = await prisma.trip.findUnique({
+        where: { id },
+        include: {
+          route: true,
+          bus: true,
+          driver: {
+            select: {
+              name: true,
+              phone: true,
+            },
           },
+          schedule: true,
         },
-        schedule: true,
-      },
+      });
+
+      return trip ? { trip } : null;
     });
 
-    if (!trip) {
+    if (!result.data) {
       return NextResponse.json(
         { error: 'Trip not found' },
         { status: 404 }
       );
     }
 
-    return NextResponse.json({ trip });
+    return NextResponse.json(result.data, { headers: cacheHeaders(result) });
   } catch (error) {
     console.error('Get trip error:', error);
     return NextResponse.json(
@@ -59,7 +75,13 @@ export async function PUT(req, { params }) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { status } = await req.json();
 
@@ -141,10 +163,18 @@ export async function PUT(req, { params }) {
       req,
     });
 
+    // Trip status drives the dashboard, reports and the trips list.
+    await invalidate(
+      CACHE_NAMESPACES.TRIPS,
+      CACHE_NAMESPACES.DASHBOARD,
+      CACHE_NAMESPACES.REPORTS,
+    );
+
     return NextResponse.json({
       message: `Trip ${status?.toLowerCase() || 'updated'} successfully`,
       trip: updatedTrip,
     });
+
   } catch (error) {
     console.error('Update trip error:', error);
     return NextResponse.json(
@@ -164,7 +194,13 @@ export async function DELETE(req, { params }) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     // Check if trip exists
     const trip = await prisma.trip.findUnique({
       where: { id },
@@ -196,9 +232,16 @@ export async function DELETE(req, { params }) {
       req,
     });
 
+    await invalidate(
+      CACHE_NAMESPACES.TRIPS,
+      CACHE_NAMESPACES.DASHBOARD,
+      CACHE_NAMESPACES.REPORTS,
+    );
+
     return NextResponse.json({
       message: 'Trip deleted successfully',
     });
+
   } catch (error) {
     console.error('Delete trip error:', error);
     return NextResponse.json(

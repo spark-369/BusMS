@@ -2,6 +2,9 @@ import { NextResponse } from 'next/server';
 import bcrypt from 'bcryptjs';
 import prisma from '@/lib/prisma';
 import { authMiddleware } from '@/middleware/auth';
+import { enforceRateLimit } from '@/lib/rateLimiter';
+import { logActivity } from '@/lib/activityLogger';
+import { CACHE_NAMESPACES, invalidate } from '@/lib/cache';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,7 +17,13 @@ export async function GET(req, { params }) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_READ', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { id } = params;
 
@@ -68,7 +77,13 @@ export async function PUT(req, { params }) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { id } = params;
     const { name, phone, password, passengerId, licenseNumber, department, year } = await req.json();
@@ -98,15 +113,15 @@ export async function PUT(req, { params }) {
     // No separate records to update
 
     // Log activity
-    await prisma.activityLog.create({
-      data: {
-        userId: user.id,
-        action: 'UPDATE_USER',
-        details: `User profile updated: ${updatedUser.email}`,
-      },
+    await logActivity({
+      userId: user.id,
+      action: 'UPDATE_USER',
+      details: `User profile updated: ${updatedUser.email}`,
+      req,
     });
 
     const { password: _, ...userWithoutPassword } = updatedUser;
+
 
     return NextResponse.json({
       message: 'User updated successfully',
@@ -129,7 +144,13 @@ export async function DELETE(req, { params }) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { id } = params;
 
     const user = await prisma.user.findUnique({
@@ -150,17 +171,21 @@ export async function DELETE(req, { params }) {
     });
 
     // Log activity
-    await prisma.activityLog.create({
-      data: {
-        userId: id,
-        action: 'DEACTIVATE_USER',
-        details: `User deactivated by admin: ${user.email}`,
-      },
+    await logActivity({
+      userId: authResult.user.id,
+      action: 'DEACTIVATE_USER',
+      details: `User deactivated by admin: ${user.email}`,
+      req,
     });
+
+    // Deactivating a driver frees them from the assignment pool and changes
+    // the dashboard's active-driver count.
+    await invalidate(CACHE_NAMESPACES.DASHBOARD, CACHE_NAMESPACES.ASSIGNMENTS);
 
     return NextResponse.json({
       message: 'User deactivated successfully',
     });
+
   } catch (error) {
     console.error('Delete user error:', error);
     return NextResponse.json(

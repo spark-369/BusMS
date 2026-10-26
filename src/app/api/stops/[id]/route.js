@@ -1,6 +1,13 @@
 import { NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { authMiddleware } from '@/middleware/auth';
+import { enforceRateLimit } from '@/lib/rateLimiter';
+import {
+  cacheHeaders,
+  CACHE_NAMESPACES,
+  invalidate,
+  withCache,
+} from '@/lib/cache';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -13,29 +20,38 @@ export async function GET(req, { params }) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_READ', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
     const { id } = params;
 
-    const stop = await prisma.stop.findUnique({
-      where: { id },
-      include: {
-        route: {
-          select: {
-            id: true,
-            name: true,
+    const result = await withCache(CACHE_NAMESPACES.STOPS, `id:${id}`, async () => {
+      const stop = await prisma.stop.findUnique({
+        where: { id },
+        include: {
+          route: {
+            select: {
+              id: true,
+              name: true,
+            },
           },
         },
-      },
+      });
+
+      return stop ? { stop } : null;
     });
 
-    if (!stop) {
+    if (!result.data) {
       return NextResponse.json(
         { error: 'Stop not found' },
         { status: 404 }
       );
     }
 
-    return NextResponse.json({ stop });
+    return NextResponse.json(result.data, { headers: cacheHeaders(result) });
   } catch (error) {
     console.error('Get stop error:', error);
     return NextResponse.json(
@@ -53,7 +69,13 @@ export async function PUT(req, { params }) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { id } = params;
     const data = await req.json();
 
@@ -115,7 +137,13 @@ export async function DELETE(req, { params }) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { id } = params;
 
     const existingStop = await prisma.stop.findUnique({
@@ -141,7 +169,9 @@ export async function DELETE(req, { params }) {
         where: { id },
         data: { isActive: false },
       });
-      
+
+      await invalidate(CACHE_NAMESPACES.STOPS, CACHE_NAMESPACES.ROUTES);
+
       return NextResponse.json({
         message: 'Stop has related bookings, so it has been marked as inactive instead of deleted',
       });
@@ -151,9 +181,12 @@ export async function DELETE(req, { params }) {
       where: { id },
     });
 
+    await invalidate(CACHE_NAMESPACES.STOPS, CACHE_NAMESPACES.ROUTES);
+
     return NextResponse.json({
       message: 'Stop deleted successfully',
     });
+
   } catch (error) {
     console.error('Delete stop error:', error);
     return NextResponse.json(

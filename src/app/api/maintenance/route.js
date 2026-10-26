@@ -2,6 +2,15 @@ import { NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { authMiddleware } from '@/middleware/auth';
 import { logActivity } from '@/lib/activityLogger';
+import { enforceRateLimit } from '@/lib/rateLimiter';
+import { enqueueNotification } from '@/lib/enqueue';
+import {
+  cacheHeaders,
+  CACHE_NAMESPACES,
+  invalidate,
+  searchParamsKey,
+  withCache,
+} from '@/lib/cache';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,10 +23,20 @@ export async function GET(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_READ', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+    const result = await withCache(
+      CACHE_NAMESPACES.MAINTENANCE,
+      searchParamsKey(req),
+      async () => {
     const { searchParams } = new URL(req.url);
     const busId = searchParams.get('busId');
     const status = searchParams.get('status');
+
     const type = searchParams.get('type');
 
     const where = {};
@@ -41,7 +60,11 @@ export async function GET(req) {
       },
     });
 
-    return NextResponse.json({ maintenance });
+    return { maintenance };
+      },
+    );
+
+    return NextResponse.json(result.data, { headers: cacheHeaders(result) });
   } catch (error) {
     console.error('Get maintenance error:', error);
     return NextResponse.json(
@@ -58,6 +81,11 @@ export async function POST(req) {
   if (authResult instanceof NextResponse) {
     return authResult;
   }
+
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
 
   try {
     const { user } = authResult;
@@ -122,14 +150,12 @@ export async function POST(req) {
     }
 
     // Notify drivers about maintenance
-    await prisma.notification.create({
-      data: {
-        userRole: 'DRIVER',
-        type: 'MAINTENANCE_CREATED',
-        title: 'Bus Maintenance Scheduled',
-        message: `Maintenance scheduled for bus ${bus.busNumber} (${type}) on ${parsedScheduledDate.toLocaleDateString()}`,
-        link: '/maintenance',
-      }
+    await enqueueNotification({
+      userRole: 'DRIVER',
+      type: 'MAINTENANCE_CREATED',
+      title: 'Bus Maintenance Scheduled',
+      message: `Maintenance scheduled for bus ${bus.busNumber} (${type}) on ${parsedScheduledDate.toLocaleDateString()}`,
+      link: '/maintenance',
     });
 
     await logActivity({
@@ -138,6 +164,14 @@ export async function POST(req) {
       details: `Maintenance (${type}) scheduled for bus ${bus.busNumber}`,
       req,
     });
+
+    // Maintenance records surface on the dashboard and in the bus detail view,
+    // and a REPAIR/BREAKDOWN also flips the bus status.
+    await invalidate(
+      CACHE_NAMESPACES.MAINTENANCE,
+      CACHE_NAMESPACES.BUSES,
+      CACHE_NAMESPACES.DASHBOARD,
+    );
 
     return NextResponse.json({
       message: 'Maintenance record created successfully',
@@ -159,6 +193,11 @@ export async function PUT(req) {
   if (authResult instanceof NextResponse) {
     return authResult;
   }
+
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
 
   try {
     const { id, status, cost, notes } = await req.json();
@@ -226,10 +265,17 @@ export async function PUT(req) {
       req,
     });
 
+    await invalidate(
+      CACHE_NAMESPACES.MAINTENANCE,
+      CACHE_NAMESPACES.BUSES,
+      CACHE_NAMESPACES.DASHBOARD,
+    );
+
     return NextResponse.json({
       message: 'Maintenance updated successfully',
       maintenance,
     });
+
   } catch (error) {
     console.error('Update maintenance error:', error);
     return NextResponse.json(
@@ -246,6 +292,11 @@ export async function DELETE(req) {
   if (authResult instanceof NextResponse) {
     return authResult;
   }
+
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
 
   try {
     const { searchParams } = new URL(req.url);
@@ -280,9 +331,16 @@ export async function DELETE(req) {
       req,
     });
 
+    await invalidate(
+      CACHE_NAMESPACES.MAINTENANCE,
+      CACHE_NAMESPACES.BUSES,
+      CACHE_NAMESPACES.DASHBOARD,
+    );
+
     return NextResponse.json({
       message: 'Maintenance record deleted successfully',
     });
+
   } catch (error) {
     console.error('Delete maintenance error:', error);
     return NextResponse.json(

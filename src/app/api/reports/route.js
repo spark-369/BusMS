@@ -1,6 +1,19 @@
 import { NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { authMiddleware } from "@/middleware/auth";
+import { enforceRateLimit } from "@/lib/rateLimiter";
+import {
+  cacheHeaders,
+  CACHE_NAMESPACES,
+  searchParamsKey,
+  withCache,
+} from "@/lib/cache";
+import {
+  dayRange,
+  startOfDay,
+  startOfNextDay,
+  toLocalDateKey,
+} from "@/utils/dates";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,13 +26,26 @@ export async function GET(req) {
     return authResult;
   }
 
+  // Reports are the heaviest read in the app (per-driver loops, aggregate
+  // scans), so they get the tightest read allowance.
+  const limited = await enforceRateLimit(req, "REPORTS", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+    // Cache per query-string: different report types/ranges are independent.
+    const result = await withCache(
+      CACHE_NAMESPACES.REPORTS,
+      searchParamsKey(req),
+      async () => {
     const { searchParams } = new URL(req.url);
     const type = searchParams.get("type"); // daily, weekly, monthly, driver-performance, bus-usage
     const startDate = searchParams.get("startDate");
     const endDate = searchParams.get("endDate");
     const busId = searchParams.get("busId");
     const driverId = searchParams.get("driverId");
+
 
     const dateFilter = {};
     if (startDate) dateFilter.gte = new Date(startDate);
@@ -29,17 +55,17 @@ export async function GET(req) {
 
     switch (type) {
       case "daily-summary":
-        // Get today's trip summary
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const tomorrow = new Date(today);
-        tomorrow.setDate(tomorrow.getDate() + 1);
+        // Get today's trip summary. `startOfDay`/`startOfNextDay` are used
+        // instead of mutating a Date with setHours + toISOString, which produced
+        // a UTC-labelled date that was a day early for UTC+ timezones.
+        const todayStart = startOfDay();
+        const tomorrowStart = startOfNextDay();
 
         const todayTrips = await prisma.trip.findMany({
           where: {
             startTime: {
-              gte: today,
-              lt: tomorrow,
+              gte: todayStart,
+              lt: tomorrowStart,
             },
           },
           include: {
@@ -55,10 +81,15 @@ export async function GET(req) {
           },
         });
 
-        // Attendance derived from bookings linked to today's trips.
+        // Attendance is derived from BOOKINGS dated today, deliberately matching
+        // the criteria the write path uses when a driver verifies a pass
+        // (`userId` + `bookingDate` today + status). Filtering by
+        // `tripId IN today's trips` instead — as this did before — silently
+        // dropped every booking whose `tripId` is null (it is optional in the
+        // schema), so attendance that HAD been recorded showed up as absent.
         const dailyBookings = await prisma.booking.findMany({
           where: {
-            tripId: { in: todayTrips.map((t) => t.id) },
+            bookingDate: dayRange(),
             status: { in: ["CONFIRMED", "COMPLETED"] },
           },
           select: { id: true, isUsed: true },
@@ -66,9 +97,10 @@ export async function GET(req) {
 
         const totalAttendance = dailyBookings.length;
         const presentAttendance = dailyBookings.filter((b) => b.isUsed).length;
+        const absentAttendance = totalAttendance - presentAttendance;
 
         report = {
-          date: today.toISOString().split("T")[0],
+          date: toLocalDateKey(todayStart),
           totalTrips: todayTrips.length,
           completedTrips: todayTrips.filter((t) => t.status === "COMPLETED")
             .length,
@@ -78,10 +110,12 @@ export async function GET(req) {
           stats: {
             total: totalAttendance,
             present: presentAttendance,
-            absent: totalAttendance - presentAttendance,
+            absent: absentAttendance,
+            // Guard the divisor: 0/0 is NaN, which would render as "NaN%" in the
+            // UI. Rounding also avoids values like 33.33333333333333.
             attendanceRate:
               totalAttendance > 0
-                ? (presentAttendance / totalAttendance) * 100
+                ? Math.round((presentAttendance / totalAttendance) * 1000) / 10
                 : 0,
           },
         };
@@ -248,7 +282,11 @@ export async function GET(req) {
         };
     }
 
-    return NextResponse.json(report);
+      return report;
+      },
+    );
+
+    return NextResponse.json(result.data, { headers: cacheHeaders(result) });
   } catch (error) {
     console.error("Get reports error:", error);
     return NextResponse.json(

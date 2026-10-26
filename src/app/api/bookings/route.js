@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { authMiddleware } from "@/middleware/auth";
+import { enforceRateLimit } from "@/lib/rateLimiter";
+import { enqueueNotification } from "@/lib/enqueue";
+import { dayRange, parseDateOnly, startOfDay, startOfNextDay } from "@/utils/dates";
+import { CACHE_NAMESPACES, invalidate } from "@/lib/cache";
 import QRCode from "qrcode";
 import { v4 as uuidv4 } from "uuid";
 
@@ -15,7 +19,13 @@ export async function GET(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_READ", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { searchParams } = new URL(req.url);
     const status = searchParams.get("status");
@@ -39,12 +49,12 @@ export async function GET(req) {
       where.isUsed = isUsed === "true";
     }
     if (bookingDate) {
-      const date = new Date(bookingDate);
-      const nextDay = new Date(date);
-      nextDay.setDate(nextDay.getDate() + 1);
+      // Local-day window with an exclusive upper bound. `parseDateOnly` keeps a
+      // date-only input from being interpreted as UTC midnight (which would
+      // shift the window by a day for non-UTC timezones).
       where.bookingDate = {
-        gte: date,
-        lt: nextDay,
+        gte: startOfDay(parseDateOnly(bookingDate)),
+        lt: startOfNextDay(parseDateOnly(bookingDate)),
       };
     }
 
@@ -93,7 +103,15 @@ export async function POST(req) {
     return authResult;
   }
 
+  // Bookings are the highest-value write in the app (they consume seat
+  // inventory), so they get their own tighter policy than generic writes.
+  const limited = await enforceRateLimit(req, "BOOKING_WRITE", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { tripId, stopId, bookingDate } = await req.json();
 
@@ -104,7 +122,11 @@ export async function POST(req) {
       );
     }
 
-    const parsedBookingDate = new Date(bookingDate);
+    // Parsed as LOCAL midnight. A bare `new Date(bookingDate)` would parse a
+    // date-only string as UTC midnight, so the day window below would be offset
+    // for any non-zero UTC timezone and the duplicate check could miss an
+    // existing booking on the same local day.
+    const parsedBookingDate = parseDateOnly(bookingDate);
     if (isNaN(parsedBookingDate.getTime())) {
       return NextResponse.json(
         { error: "Invalid booking date" },
@@ -128,11 +150,10 @@ export async function POST(req) {
       );
     }
 
-    const startOfDay = new Date(parsedBookingDate);
-    startOfDay.setHours(0, 0, 0, 0);
-
-    const endOfDay = new Date(parsedBookingDate);
-    endOfDay.setHours(23, 59, 59, 999);
+    // Local-day bounds for the duplicate check. Named distinctly from the
+    // imported helpers to avoid shadowing them.
+    const bookingDayStart = dayRange(parsedBookingDate).gte;
+    const bookingDayEnd = dayRange(parsedBookingDate).lte;
 
     // Check if stop exists and belongs to the trip's route
     const stop = await prisma.stop.findUnique({
@@ -158,7 +179,7 @@ export async function POST(req) {
       where: {
         userId: user.id,
         tripId,
-        bookingDate: { gte: startOfDay, lte: endOfDay },
+        bookingDate: { gte: bookingDayStart, lte: bookingDayEnd },
         status: { in: ["PENDING", "CONFIRMED"] },
       },
     });
@@ -185,7 +206,7 @@ export async function POST(req) {
         const bookingCount = await tx.booking.count({
           where: {
             tripId,
-            bookingDate: { gte: startOfDay, lte: endOfDay },
+            bookingDate: { gte: bookingDayStart, lte: bookingDayEnd },
             status: "CONFIRMED",
           },
         });
@@ -215,15 +236,16 @@ export async function POST(req) {
       { isolationLevel: "Serializable" },
     );
 
-    await prisma.notification.create({
-      data: {
-        userRole: "DRIVER",
-        type: "BOOKING_CONFIRMATION",
-        title: "New Booking Confirmed",
-        message: `New booking for trip on route "${trip.route.name}" - Seat ${booking.seatNumber}`,
-        link: "/bookings",
-      },
+    await enqueueNotification({
+      userRole: "DRIVER",
+      type: "BOOKING_CONFIRMATION",
+      title: "New Booking Confirmed",
+      message: `New booking for trip on route "${trip.route.name}" - Seat ${booking.seatNumber}`,
+      link: "/bookings",
     });
+
+    // A new booking changes the attendance denominators in the daily report.
+    await invalidate(CACHE_NAMESPACES.REPORTS, CACHE_NAMESPACES.DASHBOARD);
 
     return NextResponse.json(
       {

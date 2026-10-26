@@ -2,6 +2,10 @@ import { NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { authMiddleware } from "@/middleware/auth";
 import { logActivity } from "@/lib/activityLogger";
+import { enforceRateLimit } from "@/lib/rateLimiter";
+import { enqueueNotification } from "@/lib/enqueue";
+import { CACHE_NAMESPACES, invalidate } from "@/lib/cache";
+import { startOfDay, startOfNextDay } from "@/utils/dates";
 import QRCode from "qrcode";
 import { v4 as uuidv4 } from "uuid";
 
@@ -16,7 +20,13 @@ export async function GET(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_READ", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { searchParams } = new URL(req.url);
     const passengerId = searchParams.get("passengerId");
@@ -57,6 +67,11 @@ export async function POST(req) {
   if (authResult instanceof NextResponse) {
     return authResult;
   }
+
+  const limited = await enforceRateLimit(req, "BULK_WRITE", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
 
   try {
     const { passengerId, startDate, endDate } = await req.json();
@@ -144,14 +159,12 @@ export async function POST(req) {
     });
 
     // Create notification for the passenger
-    await prisma.notification.create({
-      data: {
-        userRole: "PASSENGER",
-        type: "BUS_PASS_CREATED",
-        title: "Bus Pass Created",
-        message: `Your bus pass (${passNumber}) has been created successfully. Valid until ${new Date(endDate).toLocaleDateString()}`,
-        link: "/buspass",
-      },
+    await enqueueNotification({
+      userRole: "PASSENGER",
+      type: "BUS_PASS_CREATED",
+      title: "Bus Pass Created",
+      message: `Your bus pass (${passNumber}) has been created successfully. Valid until ${new Date(endDate).toLocaleDateString()}`,
+      link: "/buspass",
     });
 
     await logActivity({
@@ -185,6 +198,13 @@ export async function PUT(req) {
     return authResult;
   }
 
+  // QR verification is called once per boarding passenger and writes an
+  // attendance record, so it gets its own sliding-window policy.
+  const limited = await enforceRateLimit(req, "QR_VERIFY", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
     const { user } = authResult;
     const { qrCode, passNumber } = await req.json();
@@ -210,15 +230,16 @@ export async function PUT(req) {
 
     // Attendance is recorded when a driver verifies a pass: mark today's
     // confirmed bookings for this passenger as used (attended).
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-    const endOfToday = new Date();
-    endOfToday.setHours(23, 59, 59, 999);
-
+    //
+    // This window must match the one the reports read path uses, or recorded
+    // attendance will not be counted. An exclusive upper bound
+    // (`lt: startOfNextDay()`) is used rather than `lte: endOfToday` because the
+    // latter silently excludes anything in the final millisecond of the day
+    // (e.g. exactly 23:59:59.9995, or a value truncated on write).
     const attendanceResult = await prisma.booking.updateMany({
       where: {
         userId: busPass.passengerId,
-        bookingDate: { gte: startOfToday, lte: endOfToday },
+        bookingDate: { gte: startOfDay(), lt: startOfNextDay() },
         status: { in: ["CONFIRMED", "COMPLETED"] },
         isUsed: false,
       },
@@ -233,6 +254,13 @@ export async function PUT(req) {
       details: `Bus pass ${busPass.passNumber} verified; ${attendanceResult.count} booking(s) marked attended`,
       req,
     });
+
+    // Recording attendance changes what the attendance report shows, but the
+    // reports namespace was not being flushed here. Combined with the 60s
+    // reports TTL, a driver verifying a pass would still see "0 present" on the
+    // Reports page until the cache expired — which is exactly the symptom of the
+    // Attendance Summary appearing stuck at 0%.
+    await invalidate(CACHE_NAMESPACES.REPORTS, CACHE_NAMESPACES.DASHBOARD);
 
     return NextResponse.json({
       valid: true,
@@ -339,6 +367,11 @@ export async function DELETE(req) {
   if (authResult instanceof NextResponse) {
     return authResult;
   }
+
+  const limited = await enforceRateLimit(req, "BULK_WRITE", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
 
   try {
     const { searchParams } = new URL(req.url);

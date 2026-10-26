@@ -2,6 +2,14 @@ import { NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { authMiddleware } from "@/middleware/auth";
 import { logActivity } from "@/lib/activityLogger";
+import { enforceRateLimit } from "@/lib/rateLimiter";
+import {
+  cacheHeaders,
+  CACHE_NAMESPACES,
+  invalidate,
+  searchParamsKey,
+  withCache,
+} from "@/lib/cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,40 +22,55 @@ export async function GET(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_READ", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
-    const { searchParams } = new URL(req.url);
-    const status = searchParams.get("status");
+    // Cache-aside: the query is shared by every role (no role-dependent
+    // filtering), so the cache key only needs the query string.
+    const result = await withCache(
+      CACHE_NAMESPACES.BUSES,
+      searchParamsKey(req),
+      async () => {
+        const { searchParams } = new URL(req.url);
+        const status = searchParams.get("status");
 
-    const where = {};
-    if (status) where.status = status;
+        const where = {};
+        if (status) where.status = status;
 
-    const buses = await prisma.bus.findMany({
-      where,
-      include: {
-        driver: {
-          select: {
-            name: true,
-            phone: true,
-          },
-        },
-        schedules: {
+        const buses = await prisma.bus.findMany({
+          where,
           include: {
-            route: {
+            driver: {
               select: {
-                id: true,
                 name: true,
+                phone: true,
               },
             },
+            schedules: {
+              include: {
+                route: {
+                  select: {
+                    id: true,
+                    name: true,
+                  },
+                },
+              },
+              take: 5,
+            },
           },
-          take: 5,
-        },
-      },
-      orderBy: {
-        busNumber: "asc",
-      },
-    });
+          orderBy: {
+            busNumber: "asc",
+          },
+        });
 
-    return NextResponse.json({ buses });
+        return { buses };
+      },
+    );
+
+    return NextResponse.json(result.data, { headers: cacheHeaders(result) });
   } catch (error) {
     console.error("Get buses error:", error);
     return NextResponse.json(
@@ -65,7 +88,13 @@ export async function POST(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_WRITE", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { busNumber, plateNumber, capacity, model, year, fuelType, mileage } =
       await req.json();
@@ -117,6 +146,14 @@ export async function POST(req) {
       details: `Bus ${bus.busNumber} (${bus.plateNumber}) created`,
       req,
     });
+
+    // Buses feed the bus list, the driver-assignment view and the dashboard
+    // counters, so all three namespaces are flushed.
+    await invalidate(
+      CACHE_NAMESPACES.BUSES,
+      CACHE_NAMESPACES.ASSIGNMENTS,
+      CACHE_NAMESPACES.DASHBOARD,
+    );
 
     return NextResponse.json(
       {

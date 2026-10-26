@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
 import { Button, Input, Alert } from "@/components/ui";
+import { useRateLimit } from "@/hooks/useRateLimit";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -13,6 +14,12 @@ export default function LoginPage() {
     email: "",
     password: "",
   });
+  const [rateLimitMessage, setRateLimitMessage] = useState("");
+
+  // Client-side mirror of the server's LOGIN policy. `guard()` refuses the
+  // request locally; `handleError()` folds a real server 429 back in so the
+  // countdown reflects the server's Retry-After.
+  const limiter = useRateLimit("login");
 
   const handleChange = (e) => {
     setFormData({
@@ -23,11 +30,39 @@ export default function LoginPage() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    setRateLimitMessage("");
+
+    // Pre-flight check only: the axios interceptor is the single place that
+    // consumes a local token, so we peek here (`consumeToken: false`) to render
+    // an immediate message without double-counting the attempt.
+    const verdict = limiter.guard({ consumeToken: false });
+    if (!verdict.allowed) {
+      setRateLimitMessage(verdict.message);
+      return;
+    }
+
     try {
       await login(formData.email, formData.password);
+      // A successful login clears the local attempt counter.
+      limiter.reset();
       router.push("/dashboard");
     } catch (err) {
-      // Error is handled by AuthContext
+      // A rejection raised by the local limiter (axios request interceptor).
+      if (err?.isClientRateLimited) {
+        setRateLimitMessage(err.message);
+        return;
+      }
+
+      // Distinguish "the server rate-limited us" from a genuine auth failure so
+      // the user gets an accurate, actionable message.
+      if (limiter.handleError(err)) {
+        setRateLimitMessage(
+          err.response?.data?.error ||
+            `Too many login attempts. Please wait ${limiter.waitLabel || "a moment"}.`,
+        );
+        return;
+      }
+      // Any other error is already handled by AuthContext.
     }
   };
 
@@ -45,9 +80,16 @@ export default function LoginPage() {
         </div>
 
         <div className="rounded-2xl bg-slate-900 p-8 shadow-2xl ring-1 ring-slate-800">
-          {error && (
+          {error && !rateLimitMessage && (
             <Alert variant="danger" className="mb-4">
               {error}
+            </Alert>
+          )}
+
+          {(rateLimitMessage || limiter.isLimited) && (
+            <Alert variant="warning" className="mb-4">
+              {rateLimitMessage ||
+                `Too many attempts. Please wait ${limiter.waitLabel} before trying again.`}
             </Alert>
           )}
 
@@ -77,8 +119,9 @@ export default function LoginPage() {
               variant="primary"
               className="w-full"
               loading={loading}
+              disabled={limiter.isLimited}
             >
-              Sign In
+              {limiter.isLimited ? `Try again in ${limiter.waitLabel}` : "Sign In"}
             </Button>
           </form>
 
@@ -98,3 +141,4 @@ export default function LoginPage() {
     </div>
   );
 }
+

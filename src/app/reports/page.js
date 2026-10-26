@@ -343,28 +343,32 @@ export default function ReportsPage() {
                   <h3 className="text-lg font-semibold mb-4">
                     Attendance Summary
                   </h3>
-                  <div className="grid grid-cols-4 gap-4 text-center">
+                  {/* Responsive: 2 columns on phones, 4 from `sm` up. */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-center">
                     <div>
                       <p className="text-2xl font-bold text-blue-400">
-                        {reportData.stats.total || 0}
+                        {reportData.stats.total ?? 0}
                       </p>
                       <p className="text-sm text-slate-400">Total</p>
                     </div>
                     <div>
                       <p className="text-2xl font-bold text-emerald-400">
-                        {reportData.stats.present || 0}
+                        {reportData.stats.present ?? 0}
                       </p>
                       <p className="text-sm text-slate-400">Present</p>
                     </div>
                     <div>
                       <p className="text-2xl font-bold text-red-400">
-                        {reportData.stats.absent || 0}
+                        {reportData.stats.absent ?? 0}
                       </p>
                       <p className="text-sm text-slate-400">Absent</p>
                     </div>
                     <div>
                       <p className="text-2xl font-bold text-yellow-400">
-                        {(reportData.stats.attendanceRate || 0).toFixed(1)}%
+                        {/* `Number(...)` guards against a null/undefined or a
+                            string value: calling .toFixed() directly on those
+                            throws and would blank the whole card. */}
+                        {Number(reportData.stats.attendanceRate ?? 0).toFixed(1)}%
                       </p>
                       <p className="text-sm text-slate-400">Attendance Rate</p>
                     </div>

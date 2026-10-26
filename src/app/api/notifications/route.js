@@ -1,6 +1,15 @@
 import { NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { authMiddleware } from "@/middleware/auth";
+import { enforceRateLimit } from "@/lib/rateLimiter";
+import { enqueueBroadcast, enqueueNotification } from "@/lib/enqueue";
+import {
+  cacheHeaders,
+  CACHE_NAMESPACES,
+  invalidate,
+  searchParamsKey,
+  withCache,
+} from "@/lib/cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,46 +22,63 @@ export async function GET(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_READ", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
     const { user } = authResult;
-    const { searchParams } = new URL(req.url);
-    const isRead = searchParams.get("isRead");
-    const type = searchParams.get("type");
 
-    // Filter by user's role - notifications are targeted by role
-    // Admin sees all notifications, others see only their role's notifications
-    let where;
-    if (user.role === 'ADMIN') {
-      where = {}; // Admin sees all
-    } else {
-      where = {
-        userRole: user.role,
-      };
-    }
+    // Notifications are role-scoped, so the role MUST be part of the cache key —
+    // otherwise a passenger could be served an admin's cached feed. The TTL is
+    // short (10s) because the navbar polls this and users mark items read.
+    const result = await withCache(
+      CACHE_NAMESPACES.NOTIFICATIONS,
+      `${user.role}:${searchParamsKey(req)}`,
+      async () => {
+        const { searchParams } = new URL(req.url);
+        const isRead = searchParams.get("isRead");
+        const type = searchParams.get("type");
 
-    if (isRead !== null) where.isRead = isRead === "true";
-    if (type) where.type = type;
+        // Filter by user's role - notifications are targeted by role
+        // Admin sees all notifications, others see only their role's notifications
+        let where;
+        if (user.role === 'ADMIN') {
+          where = {}; // Admin sees all
+        } else {
+          where = {
+            userRole: user.role,
+          };
+        }
 
-    const notifications = await prisma.notification.findMany({
-      where,
-      orderBy: {
-        sentAt: "desc",
+        if (isRead !== null) where.isRead = isRead === "true";
+        if (type) where.type = type;
+
+        const notifications = await prisma.notification.findMany({
+          where,
+          orderBy: {
+            sentAt: "desc",
+          },
+          take: 50,
+        });
+
+        // Get unread count
+        let unreadWhere;
+        if (user.role === 'ADMIN') {
+          unreadWhere = { isRead: false };
+        } else {
+          unreadWhere = { userRole: user.role, isRead: false };
+        }
+        const unreadCount = await prisma.notification.count({
+          where: unreadWhere,
+        });
+
+        return { notifications, unreadCount };
       },
-      take: 50,
-    });
+    );
 
-    // Get unread count
-    let unreadWhere;
-    if (user.role === 'ADMIN') {
-      unreadWhere = { isRead: false };
-    } else {
-      unreadWhere = { userRole: user.role, isRead: false };
-    }
-    const unreadCount = await prisma.notification.count({
-      where: unreadWhere,
-    });
-
-    return NextResponse.json({ notifications, unreadCount });
+    return NextResponse.json(result.data, { headers: cacheHeaders(result) });
   } catch (error) {
     console.error("Get notifications error:", error);
     return NextResponse.json(
@@ -70,7 +96,13 @@ export async function POST(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_WRITE", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { type, title, message, userRole, link } = await req.json();
 
     if (!type || !title || !message) {
@@ -105,31 +137,23 @@ export async function POST(req) {
     // If userRole is provided, send to users with that role
     if (userRole) {
       // Create a single notification targeted by role (not per-user)
-      await prisma.notification.create({
-        data: {
-          userRole,
-          type,
-          title,
-          message,
-          link: link || '',
-        },
-      });
+      await enqueueNotification({ userRole, type, title, message, link });
     } else {
-      // Create a general notification (sent to all roles)
-      // Create one for each role
-      const roles = ["ADMIN", "DRIVER", "PASSENGER"];
-      for (const role of roles) {
-        await prisma.notification.create({
-          data: {
-            userRole: role,
-            type,
-            title,
-            message,
-            link: link || '',
-          },
-        });
-      }
+      // Create a general notification (sent to all roles). The fan-out is a
+      // single transaction inside the job handler rather than three sequential
+      // awaited inserts.
+      await enqueueBroadcast({
+        roles: ["ADMIN", "DRIVER", "PASSENGER"],
+        type,
+        title,
+        message,
+        link,
+      });
     }
+
+    // The feed is cached per role; a new notification must not be masked by a
+    // still-warm cache entry.
+    await invalidate(CACHE_NAMESPACES.NOTIFICATIONS);
 
     return NextResponse.json(
       {
@@ -137,6 +161,7 @@ export async function POST(req) {
       },
       { status: 201 },
     );
+
   } catch (error) {
     console.error("Create notification error:", error);
     return NextResponse.json(
@@ -154,7 +179,13 @@ export async function PUT(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_WRITE", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { notificationIds, markAllRead, deleteNotificationIds } =
       await req.json();
@@ -224,9 +255,14 @@ export async function PUT(req) {
       }
     }
 
+    // Both branches above change read/unread state or delete rows, which the
+    // cached per-role feed reflects.
+    await invalidate(CACHE_NAMESPACES.NOTIFICATIONS);
+
     return NextResponse.json({
       message: "Operation completed successfully",
     });
+
   } catch (error) {
     console.error("Mark read/delete error:", error);
     return NextResponse.json(
@@ -244,7 +280,13 @@ export async function DELETE(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_WRITE", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { searchParams } = new URL(req.url);
     const notificationId = searchParams.get("id");
 
@@ -261,9 +303,12 @@ export async function DELETE(req) {
       });
     }
 
+    await invalidate(CACHE_NAMESPACES.NOTIFICATIONS);
+
     return NextResponse.json({
       message: "Notification deleted successfully",
     });
+
   } catch (error) {
     console.error("Delete notification error:", error);
     return NextResponse.json(

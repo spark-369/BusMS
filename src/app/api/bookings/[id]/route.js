@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { authMiddleware } from '@/middleware/auth';
 import { logActivity } from '@/lib/activityLogger';
+import { enforceRateLimit } from '@/lib/rateLimiter';
+import { CACHE_NAMESPACES, invalidate } from '@/lib/cache';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,7 +16,13 @@ export async function GET(req, { params }) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_READ', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { id } = params;
 
@@ -75,7 +83,13 @@ export async function PUT(req, { params }) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { id } = params;
     const data = await req.json();
@@ -144,6 +158,9 @@ export async function PUT(req, { params }) {
       req,
     });
 
+    // A status change (e.g. cancelling) alters the attendance figures.
+    await invalidate(CACHE_NAMESPACES.REPORTS, CACHE_NAMESPACES.DASHBOARD);
+
     return NextResponse.json({
       message: 'Booking updated successfully',
       booking,
@@ -165,7 +182,13 @@ export async function DELETE(req, { params }) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { id } = params;
 
     const existingBooking = await prisma.booking.findUnique({
@@ -189,6 +212,8 @@ export async function DELETE(req, { params }) {
       details: `Booking ${id} deleted`,
       req,
     });
+
+    await invalidate(CACHE_NAMESPACES.REPORTS, CACHE_NAMESPACES.DASHBOARD);
 
     return NextResponse.json({
       message: 'Booking deleted successfully',

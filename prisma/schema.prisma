@@ -3,7 +3,12 @@
 
 generator client {
   provider      = "prisma-client-js"
-  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+  // `native` covers local dev; the two openssl targets cover the platforms we
+  // actually deploy to:
+  //   - debian-openssl-3.0.x -> node:20-bookworm-slim (the Docker image)
+  //   - rhel-openssl-3.0.x   -> Vercel / Amazon Linux
+  // Without the debian target the query engine is missing inside the container.
+  binaryTargets = ["native", "debian-openssl-3.0.x", "rhel-openssl-3.0.x"]
 }
 
 datasource db {

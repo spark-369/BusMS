@@ -11,7 +11,13 @@
     "build": "prisma generate && next build",
     "vercel-build": "prisma generate && prisma migrate deploy && next build",
     "start": "next start",
+    "worker": "node worker/index.mjs",
     "lint": "next lint",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run tests/unit",
+    "test:e2e": "vitest run tests/e2e",
+    "test:coverage": "vitest run --coverage",
     "postinstall": "prisma generate",
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
@@ -22,8 +28,10 @@
     "@prisma/client": "^6.0.0",
     "axios": "^1.13.5",
     "bcryptjs": "^2.4.3",
+    "bullmq": "^5.34.0",
     "date-fns": "^3.6.0",
     "html5-qrcode": "^2.3.8",
+    "ioredis": "^5.4.2",
     "jsonwebtoken": "^9.0.2",
     "leaflet": "^1.9.4",
     "next": "^14.2.0",
@@ -36,11 +44,16 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.18",
+    "@vitest/coverage-v8": "^2.1.8",
     "autoprefixer": "^10.4.24",
     "eslint": "^8.57.0",
     "eslint-config-next": "^14.2.0",
+    "jsdom": "^25.0.1",
     "postcss": "^8.5.6",
     "prisma": "^6.0.0",
-    "tailwindcss": "^4.1.18"
+    "tailwindcss": "^4.1.18",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8"
   }
 }
+

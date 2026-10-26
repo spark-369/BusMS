@@ -3,6 +3,12 @@ import bcrypt from 'bcryptjs';
 import prisma from '@/lib/prisma';
 import { generateToken } from '@/utils/jwt';
 import { logActivity } from '@/lib/activityLogger';
+import {
+  checkRateLimit,
+  getRateLimitIdentity,
+  rateLimitHeaders,
+  rateLimitResponse,
+} from '@/lib/rateLimiter';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -16,6 +22,26 @@ const PUBLIC_REGISTER_ROLES = ['PASSENGER', 'DRIVER'];
 export async function POST(req) {
   try {
     const { email, password, name, phone, role, passengerId, licenseNumber } = await req.json();
+
+    // ---------------------------------------------------------------------
+    // Rate limiting. Registration is expensive (bcrypt cost 12) and creates
+    // rows, so it is capped per IP *and* per email to prevent both mass
+    // account creation and mail-bomb style enumeration.
+    // ---------------------------------------------------------------------
+    const ipLimit = await checkRateLimit('REGISTER', getRateLimitIdentity(req));
+    if (!ipLimit.allowed) {
+      return rateLimitResponse(ipLimit);
+    }
+
+    if (typeof email === 'string' && email) {
+      const emailLimit = await checkRateLimit(
+        'REGISTER',
+        `email:${email.toLowerCase()}`,
+      );
+      if (!emailLimit.allowed) {
+        return rateLimitResponse(emailLimit);
+      }
+    }
 
     if (!email || !password || !name) {
       return NextResponse.json(
@@ -109,11 +135,15 @@ export async function POST(req) {
 
     const { password: _, ...userWithoutPassword } = user;
 
-    return NextResponse.json({
-      message: 'Registration successful',
-      token,
-      user: userWithoutPassword,
-    }, { status: 201 });
+    return NextResponse.json(
+      {
+        message: 'Registration successful',
+        token,
+        user: userWithoutPassword,
+      },
+      { status: 201, headers: rateLimitHeaders(ipLimit) },
+    );
+
   } catch (error) {
     console.error('Registration error:', error);
     return NextResponse.json(

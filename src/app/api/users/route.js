@@ -2,6 +2,9 @@ import { NextResponse } from 'next/server';
 import bcrypt from 'bcryptjs';
 import prisma from '@/lib/prisma';
 import { authMiddleware } from '@/middleware/auth';
+import { enforceRateLimit } from '@/lib/rateLimiter';
+import { logActivity } from '@/lib/activityLogger';
+import { CACHE_NAMESPACES, invalidate } from '@/lib/cache';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,7 +17,13 @@ export async function GET(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_READ', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { searchParams } = new URL(req.url);
     const role = searchParams.get('role');
@@ -67,7 +76,13 @@ export async function POST(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { email, password, name, phone, role, passengerId, licenseNumber } = await req.json();
 
     if (!email || !password || !name) {
@@ -108,16 +123,19 @@ export async function POST(req) {
     // Create user - Driver and Passenger are now handled by role in User model
     // No separate records needed
 
-    // Log activity
-    await prisma.activityLog.create({
-      data: {
-        userId: user.id,
-        action: 'CREATE_USER',
-        details: `User created by admin: ${user.email}`,
-      },
+    // Log activity (brokered through the audit queue when Redis is available).
+    await logActivity({
+      userId: user.id,
+      action: 'CREATE_USER',
+      details: `User created by admin: ${user.email}`,
+      req,
     });
 
+    // A new driver/passenger changes the user totals on the dashboard.
+    await invalidate(CACHE_NAMESPACES.DASHBOARD);
+
     const { password: _, ...userWithoutPassword } = user;
+
 
     return NextResponse.json({
       message: 'User created successfully',

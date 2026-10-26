@@ -1,9 +1,22 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Emit a self-contained server bundle at `.next/standalone` that includes
+  // only the files actually needed at runtime. This is what makes the Docker
+  // image small (no full node_modules copy) and is why the Dockerfile can run
+  // `node server.js` instead of `next start`.
+  output: "standalone",
   // Prisma and bcryptjs must be resolved at runtime (not bundled) so the
   // correct native query-engine binary is used on Vercel's serverless runtime.
+  // ioredis/bullmq are Node-only (raw sockets, Lua scripts, worker threads) and
+  // must likewise stay external — bundling them breaks the Redis client.
   experimental: {
-    serverComponentsExternalPackages: ["@prisma/client", "bcryptjs"],
+    serverComponentsExternalPackages: [
+      "@prisma/client",
+      "bcryptjs",
+      "ioredis",
+      "bullmq",
+    ],
+
     // Disable the client-side Router Cache. Without this, client-side
     // navigation between dashboard tabs could serve a cached segment and show
     // stale data until a full page refresh. Setting both to 0 forces every

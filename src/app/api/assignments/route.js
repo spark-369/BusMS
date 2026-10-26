@@ -1,6 +1,15 @@
 import { NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { authMiddleware } from "@/middleware/auth";
+import { enforceRateLimit } from "@/lib/rateLimiter";
+import { enqueueNotification } from "@/lib/enqueue";
+import {
+  cacheHeaders,
+  CACHE_NAMESPACES,
+  invalidate,
+  searchParamsKey,
+  withCache,
+} from "@/lib/cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,7 +23,16 @@ export async function GET(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_READ", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+    const result = await withCache(
+      CACHE_NAMESPACES.ASSIGNMENTS,
+      searchParamsKey(req),
+      async () => {
     const { searchParams } = new URL(req.url);
     const status = searchParams.get("status");
     const search = searchParams.get("search");
@@ -66,7 +84,7 @@ export async function GET(req) {
 
     const assignedCount = buses.filter((bus) => bus.driver).length;
 
-    return NextResponse.json({
+    return {
       buses,
       availableDrivers: drivers,
       stats: {
@@ -75,7 +93,11 @@ export async function GET(req) {
         unassignedBuses: buses.length - assignedCount,
         availableDrivers: drivers.length,
       },
-    });
+    };
+      },
+    );
+
+    return NextResponse.json(result.data, { headers: cacheHeaders(result) });
   } catch (error) {
     console.error("Get assignments error:", error);
     return NextResponse.json(
@@ -93,7 +115,13 @@ export async function POST(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_WRITE", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { busId, driverId } = await req.json();
 
@@ -179,14 +207,12 @@ export async function POST(req) {
     });
 
     // Notify drivers about the assignment
-    await prisma.notification.create({
-      data: {
-        userRole: "DRIVER",
-        type: "SCHEDULE_CHANGE",
-        title: "Bus Assignment",
-        message: `You have been assigned to bus ${bus.busNumber} (${bus.plateNumber}).`,
-        link: "/assignments",
-      },
+    await enqueueNotification({
+      userRole: "DRIVER",
+      type: "SCHEDULE_CHANGE",
+      title: "Bus Assignment",
+      message: `You have been assigned to bus ${bus.busNumber} (${bus.plateNumber}).`,
+      link: "/assignments",
     });
 
     // Audit trail
@@ -197,6 +223,14 @@ export async function POST(req) {
         details: `Driver ${driver.name} assigned to bus ${bus.busNumber} by admin ${user.email}`,
       },
     });
+
+    // Assignments change the bus list, the assignment overview and the
+    // dashboard's driver counts.
+    await invalidate(
+      CACHE_NAMESPACES.ASSIGNMENTS,
+      CACHE_NAMESPACES.BUSES,
+      CACHE_NAMESPACES.DASHBOARD,
+    );
 
     return NextResponse.json(
       {
@@ -222,7 +256,13 @@ export async function DELETE(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, "COLLECTION_WRITE", {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { searchParams } = new URL(req.url);
     const busId = searchParams.get("busId");
@@ -266,10 +306,17 @@ export async function DELETE(req) {
       },
     });
 
+    await invalidate(
+      CACHE_NAMESPACES.ASSIGNMENTS,
+      CACHE_NAMESPACES.BUSES,
+      CACHE_NAMESPACES.DASHBOARD,
+    );
+
     return NextResponse.json({
       message: "Driver unassigned successfully",
       bus: updatedBus,
     });
+
   } catch (error) {
     console.error("Unassign driver error:", error);
     return NextResponse.json(

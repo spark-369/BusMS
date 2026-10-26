@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { authMiddleware } from '@/middleware/auth';
 import { logActivity } from '@/lib/activityLogger';
+import { enforceRateLimit } from '@/lib/rateLimiter';
+import { enqueueNotification } from '@/lib/enqueue';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,7 +16,13 @@ export async function GET(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_READ', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
+
     const { user } = authResult;
     const { searchParams } = new URL(req.url);
     const tripId = searchParams.get('tripId');
@@ -77,6 +85,11 @@ export async function POST(req) {
     return authResult;
   }
 
+  const limited = await enforceRateLimit(req, 'COLLECTION_WRITE', {
+    user: authResult.user,
+  });
+  if (limited) return limited;
+
   try {
     const { user } = authResult;
     const { tripId, rating, comment } = await req.json();
@@ -136,14 +149,12 @@ export async function POST(req) {
     });
 
     // Notify admin about new feedback
-    await prisma.notification.create({
-      data: {
-        userRole: 'ADMIN',
-        type: 'FEEDBACK_RECEIVED',
-        title: 'New Feedback Received',
-        message: `New ${rating}-star feedback from ${user.name}: ${comment || 'No comment'}`,
-        link: '/feedback',
-      }
+    await enqueueNotification({
+      userRole: 'ADMIN',
+      type: 'FEEDBACK_RECEIVED',
+      title: 'New Feedback Received',
+      message: `New ${rating}-star feedback from ${user.name}: ${comment || 'No comment'}`,
+      link: '/feedback',
     });
 
     await logActivity({

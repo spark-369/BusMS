@@ -1,0 +1,33 @@
+# Keep the Docker build context small and keep secrets out of image layers.
+
+# Dependencies are installed inside the image from the lockfile.
+node_modules
+.pnp
+.pnp.js
+
+# Build output is regenerated in the builder stage.
+.next
+out
+build
+coverage
+
+# Never copy local env files or secrets into an image layer.
+# (Runtime values come from --env-file / -e / the orchestrator's secret store.)
+.env
+.env.*
+
+# Version control and editor cruft
+.git
+.gitignore
+.vercel
+.idea
+.vscode
+.DS_Store
+*.pem
+*.log
+
+# Documentation and tests are not needed to build or run the app.
+# Remove the `__tests__` line if you want tests runnable inside the image.
+README.md
+**/__tests__/**
+vitest.config.mjs
