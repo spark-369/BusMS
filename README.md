@@ -1,4 +1,4 @@
-# University Bus Scheduling Management System
+# BusMS - University Bus Scheduling Management System
 
 A full-stack **campus bus operations platform** built with Next.js 14 (App Router),
 Prisma/PostgreSQL and a Redis-optional background job pipeline. It covers the
