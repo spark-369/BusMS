@@ -1,258 +1,408 @@
-# BusMS - University Bus Scheduling Management System
+# University Bus Scheduling Management System
 
-A full-stack **Next.js 14** web application for managing university/campus bus
-transportation operations. It provides separate experiences for **Administrators**,
-**Drivers** and **Passengers** with role-based access control, live map tracking,
-digital QR bus passes, seat bookings, maintenance scheduling and analytics.
+A full-stack **campus bus operations platform** built with Next.js 14 (App Router),
+Prisma/PostgreSQL and a Redis-optional background job pipeline. It covers the
+complete lifecycle of a university shuttle service: fleet and driver management,
+route and stop authoring, timetable scheduling, trip dispatch, seat booking,
+QR-code based digital bus passes, boarding/attendance capture, maintenance
+tracking, notifications, feedback, reporting and an audit trail.
 
-The entire app — frontend UI, REST API and authentication — lives in a single
-Next.js App Router project under `my-app/`, backed by a PostgreSQL database via
-Prisma.
+> **Design principle — zero-infrastructure by default.**
+> Every optional dependency (Redis) is *additive*. With nothing but a PostgreSQL
+> connection the application is fully functional: the response cache, the rate
+> limiter and the job queue all transparently fall back to in-process
+> implementations. Configuring `REDIS_URL` upgrades those layers to
+> Redis-backed / brokered behaviour without any code change.
 
 ---
 
-## Table of Contents
+## Table of contents
 
-- [Overview](#overview)
-- [Key Features](#key-features)
-- [System Architecture](#system-architecture)
-- [Tech Stack](#tech-stack)
-- [Project Structure](#project-structure)
-- [Data Model (Database Schema)](#data-model-database-schema)
-- [User Roles & Permissions](#user-roles--permissions)
-- [Frontend Documentation](#frontend-documentation)
-  - [App Router Pages](#app-router-pages)
-  - [Layout & Navigation Components](#layout--navigation-components)
-  - [UI Component Library](#ui-component-library)
-  - [Map Components](#map-components)
-  - [State Management (Contexts)](#state-management-contexts)
-  - [API Service Layer](#api-service-layer)
-  - [Styling & Design System](#styling--design-system)
-  - [Client-Side Authentication Flow](#client-side-authentication-flow)
-- [Backend Documentation](#backend-documentation)
-  - [API Conventions](#api-conventions)
-  - [Authentication & Middleware](#authentication--middleware)
-  - [Audit Logging](#audit-logging)
-  - [API Endpoint Reference](#api-endpoint-reference)
-  - [Backend Business Logic](#backend-business-logic)
-- [How Attendance Works](#how-attendance-works)
-- [Notifications](#notifications)
-- [Security Notes](#security-notes)
-- [Redis, BullMQ & Rate Limiting](#redis-bullmq--rate-limiting)
+- [Features](#features)
+- [Tech stack](#tech-stack)
+- [Architecture](#architecture)
+- [Getting started](#getting-started)
+- [Environment variables](#environment-variables)
+- [npm scripts](#npm-scripts)
+- [Project structure](#project-structure)
+- [Data model](#data-model)
+- [API reference](#api-reference)
+- [Infrastructure layers](#infrastructure-layers)
+- [Security model](#security-model)
 - [Testing](#testing)
-- [Docker](#docker)
-- [Getting Started](#getting-started)
-- [Environment Variables](#environment-variables)
-- [Available Scripts](#available-scripts)
-- [Deploying to Vercel (Free Tier)](#deploying-to-vercel-free-tier)
-- [Troubleshooting](#troubleshooting)
+- [Deployment](#deployment)
+- [Operations and troubleshooting](#operations-and-troubleshooting)
+- [Coding conventions](#coding-conventions)
 - [License](#license)
 
 ---
 
-## Overview
+## Features
 
-The system models the day-to-day operations of a campus shuttle service:
+### Administrator
 
-- Admins define **buses**, **routes**, **stops**, **schedules**, **trips**,
-  assign **drivers**, schedule **maintenance** and issue **digital bus passes**.
-- Drivers start/complete trips and **verify passenger passes** (which records
-  attendance automatically).
-- Passengers browse routes/schedules, **book seats**, view their **QR bus pass**,
-  track their position against stops and submit **feedback**.
+| Area | Capability |
+| --- | --- |
+| **Dashboard** | Aggregate counts (users, buses, routes, schedules, trips, active buses, available drivers, today's trips, pending bookings, unread notifications), recent trips, upcoming schedules, maintenance alerts. |
+| **Fleet** | CRUD for buses (number, plate, capacity, model, year, fuel type, mileage, status). |
+| **Routes & stops** | CRUD for routes (distance, estimated duration) and geo-located stops (lat/lng, address, order) with a map-based location picker. |
+| **Schedules** | CRUD for timetables (`MORNING` / `NOON` / `EVENING` / `SPECIAL`), days-of-week arrays, special dates and notes. |
+| **Trips** | Dispatch a trip from a schedule, monitor status (`SCHEDULED → IN_PROGRESS → COMPLETED/CANCELLED`), edit or delete. |
+| **Bookings** | View all bookings, update or delete any booking. |
+| **Users** | Create/update/deactivate/delete users; assign roles and role-specific identifiers (passenger ID / driving licence). |
+| **Assignments** | Assign a driver to a bus, unassign, and see the pool of unassigned drivers. Enforces one-driver-per-bus and one-bus-per-driver. |
+| **Bus passes** | Issue digital passes (auto-generated pass number + QR data URL), extend/deactivate, delete. |
+| **Boarding** | Verify a pass QR code to mark today's bookings as attended. |
+| **Maintenance** | Log `ROUTINE` / `REPAIR` / `BREAKDOWN` / `INSPECTION` work orders; a repair/breakdown flips the bus to `MAINTENANCE`, completion flips it back to `ACTIVE` and stamps `lastMaintenance`. |
+| **Notifications** | Role-targeted notifications and organisation-wide broadcasts; emergency broadcast from the dashboard. |
+| **Reports** | Daily summary + attendance rate, bus usage, driver performance, fuel-consumption estimate, overview. |
+| **Audit trail** | Paginated activity log with filters (user, action, date range). |
+| **Feedback** | Read all passenger feedback. |
 
-All API routes run on the Node.js runtime, are never cached (`force-dynamic`) and
-enforce authorization with a shared JWT middleware.
+### Driver
 
-## Key Features
+- Driver dashboard, own trips (start / complete / cancel).
+- Passenger bookings for assigned trips.
+- **Verify bus passes** by scanning a QR code with the device camera or entering the pass number manually.
+- Routes, schedules, tracking map and notifications.
 
-### User Management
-- **Role-based Access Control**: Separate roles for Administrators, Drivers, and Passengers
-- **Secure Authentication**: JWT-based login with bcrypt-hashed credentials
-- **Self-Registration**: Public sign-up limited to Passengers and Drivers (admins are created by an existing admin)
-- **Profile Management**: Update name and phone; view account details
-- **Session Validation**: Stored sessions are re-validated against the server on load
+### Passenger
 
-### Route, Stop & Schedule Management
-- **Route Management**: Create, update, deactivate routes and manage their stops
-- **Stop Management**: Add/update/remove stops with map-based location picking, coordinates and ordering
-- **Schedule Management**: Morning, noon, evening and special schedules with days-of-week and date ranges
-- **Automatic Notifications**: Creating routes/stops/schedules/trips notifies the relevant roles
+- Passenger dashboard, trip list, live tracking map, routes and timetables.
+- **Book a seat** on a trip at a chosen stop (atomic seat allocation, duplicate-booking guard).
+- View / cancel own bookings; QR-coded booking confirmation.
+- Personal digital bus pass with QR code.
+- Submit trip feedback (1–5 stars + comment).
+- Notifications and profile management.
 
-### Live Tracking
-- **Live Map Visualization**: Route polylines and stop markers using React-Leaflet + OpenStreetMap
-- **Geolocation**: Uses the browser's current position and distance to each stop
-- **Auto-refresh**: The tracking view polls for updated stops every 30 seconds
+---
 
-### Booking & Pass Management
-- **Seat Reservation**: Seat availability is checked inside a transaction to prevent overbooking
-- **Smart Selection**: Trips are filtered to upcoming/active ones and stops are restricted to the selected trip's route
-- **Digital Bus Passes**: QR-code based passes with admin create/update/delete
-- **QR Verification**: Scan or type a pass number to validate a pass (Admin/Driver)
-- **Attendance on Verify**: When a driver verifies a passenger's pass, that passenger's
-  active booking for the day is automatically marked as **attended** — no manual
-  admin step required
-- **Booking Management**: Filter, confirm, cancel, edit and delete bookings by role
+## Tech stack
 
-### Administrative Control
-- **Dashboard**: Statistics plus recent trips, upcoming schedules and maintenance alerts
-- **Driver Assignment**: Assign/unassign drivers to buses (one driver per bus)
-- **Maintenance Scheduling**: Track routine/repair/breakdown/inspection work and auto-update bus status
-- **Emergency Broadcasting**: Send emergency notifications to all roles from the dashboard
-- **User Management**: Create, update and deactivate users
+| Layer | Technology | Notes |
+| --- | --- | --- |
+| Framework | **Next.js 14** (App Router, JavaScript) | `output: "standalone"` for container builds |
+| UI | **React 18**, **Tailwind CSS v4** (`@tailwindcss/postcss`) | Dark-mode-only design system in `globals.css` |
+| Icons | `react-icons` (Feather set) | |
+| Maps | `leaflet` + `react-leaflet` | Dynamically imported with `ssr: false` |
+| QR | `qrcode` (server-side data URL), `html5-qrcode` (client scanner) | |
+| HTTP client | `axios` | Single instance with request/response interceptors |
+| Database | **PostgreSQL** via **Prisma 6** | `prisma-client-js`, multi-platform binary targets |
+| Auth | `jsonwebtoken` (JWT), `bcryptjs` (12 rounds) | Bearer-token auth, re-validated against the DB per request |
+| Jobs | **BullMQ 5** + `ioredis` | Optional; degrades to inline execution |
+| Dates | `date-fns` + local-day helpers | |
+| IDs | `uuid`, Prisma `cuid()` | |
+| Tests | **Vitest 2**, `@vitest/coverage-v8`, `jsdom` | Native ESM, so `.mjs` workers are testable |
+| Lint | `eslint` + `eslint-config-next` (`next/core-web-vitals`) | |
+| Runtime | Node.js **≥ 18.18.0** | |
 
-### Reporting & Analytics
-- **Daily Summary**: Today's trips plus attendance (total / present / absent / rate)
-- **Bus Usage**: Trips and bookings per bus
-- **Driver Performance**: Trip counts and availability per driver
-- **Fuel Consumption**: Estimated fuel usage and cost per bus
-
-### UI/UX
-- **Modern Design System**: Consistent slate/blue palette, rounded surfaces, soft shadows
-- **Fast Perceived Navigation**: Route-level loading state, page-enter transitions and a sticky blurred header
-- **Accessible**: Keyboard-visible focus rings, ARIA labels, `prefers-reduced-motion` support, Escape-to-close modals, click-outside dropdowns
-- **Responsive**: Mobile-first layouts with a slide-in sidebar drawer
+---
 
 
-### Security & Compliance
-- **Activity Logs**: Every mutating action is written to an audit trail with actor, IP and user agent
-- **Encrypted Authentication**: Secure JWT-based tokens
-- **Input Validation**: All write endpoints validate fields, enums, ranges, dates and references
-
-
-## System Architecture
+## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Browser (React 18)                        │
-│                                                                  │
-│  Pages (App Router)  ──►  Contexts (Auth/App)  ──►  Services      │
-│        │                      │                      │           │
-│        └── DashboardLayout    └── localStorage       └── axios    │
-│            (Sidebar/Navbar)       (token+user)          client    │
-└───────────────────────────────┬──────────────────────────────────┘
-                                │  fetch / axios  (Bearer JWT)
-                                ▼
-┌──────────────────────────────────────────────────────────────────┐
-│              Next.js Route Handlers (Node.js runtime)            │
-│                                                                  │
-│   /app/api/**/route.js                                           │
-│        │                                                         │
-│        ├── authMiddleware(req, roles)  ── verifyToken + Prisma   │
-│        ├── logActivity({...})          ── audit trail            │
-│        └── prisma.<model>.<op>()       ── business logic         │
-└───────────────────────────────┬──────────────────────────────────┘
-                                │  Prisma Client
-                                ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                   PostgreSQL Database                            │
-│   User · Bus · Route · Stop · Schedule · Trip · Booking ·        │
-│   BusPass · Maintenance · Notification · Feedback · ActivityLog  │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Browser (React 18 client components)                                    │
+│                                                                          │
+│  src/app/**/page.js ──► src/context/{Auth,App}Context ──► src/services/*  │
+│            │                                              (axios +        │
+│            └── src/components/{ui,layout,map,QRVerifier}   interceptors)  │
+└───────────────────────────────────┬──────────────────────────────────────┘
+                                    │  fetch  /api/*
+┌───────────────────────────────────▼──────────────────────────────────────┐
+│  Next.js Route Handlers  (src/app/api/**/route.js, runtime = 'nodejs')    │
+│                                                                          │
+│   authMiddleware  ──►  enforceRateLimit  ──►  withCache  ──►  Prisma      │
+│   (JWT + DB)           (Redis|memory)        (Redis|memory)               │
+│                                    │                                     │
+│                                    └──► logActivity / enqueue*            │
+└───────────────────────────────────┬──────────────────────────────────────┘
+                          ┌─────────┴──────────┐
+                          ▼                    ▼
+                ┌──────────────────┐  ┌────────────────────────────┐
+                │ BullMQ (Redis)   │  │ Inline fallback            │
+                │ notifications Q  │  │ same job handlers, run     │
+                │ audit Q          │  │ synchronously in-request   │
+                └────────┬─────────┘  └────────────────────────────┘
+                         ▼
+                ┌──────────────────┐
+                │ worker/index.mjs │  ──►  Prisma  ──►  PostgreSQL
+                └──────────────────┘
 ```
 
-## Tech Stack
+### Request lifecycle
 
-### Frontend
-- **Next.js 14** — React framework with the App Router.
-- **React 18** — UI library.
-- **TailwindCSS v4** — utility-first CSS (via `@tailwindcss/postcss`).
-- **React Context** — global state management (`AuthContext`, `AppContext`).
-- **React-Leaflet / Leaflet** — map integration with OpenStreetMap tiles.
-- **React Icons** — icon library (`react-icons/fi`).
-- **Axios** — HTTP client with request/response interceptors.
-- **html5-qrcode** — in-browser QR scanning.
-- **date-fns** — date utilities.
+Every API route follows the same five-step contract:
 
-### Backend
-- **Next.js Route Handlers** — server-side API endpoints (Node.js runtime).
-- **Prisma** — ORM and type-safe query builder.
-- **PostgreSQL** — relational database.
-- **jsonwebtoken** — JWT signing/verification.
-- **bcryptjs** — password hashing.
-- **qrcode** — server-side QR data-URL generation.
-- **uuid** — unique QR identifiers.
+1. **`authMiddleware(req, roles)`** — parses the `Bearer` token, verifies it,
+   loads the user, rejects inactive accounts and wrong roles. Returns either
+   `{ user }` or a ready-to-return `NextResponse` (401/403). Route code always
+   checks `if (authResult instanceof NextResponse) return authResult;`.
+2. **`enforceRateLimit(req, POLICY, { user })`** — returns `null` when allowed or
+   a `429` response when not.
+3. **`withCache(namespace, suffix, producer)`** — cache-aside read. The producer
+   only runs on a miss. The result carries `X-Cache` / `X-Cache-Source` headers.
+4. **Prisma query / mutation**, followed by `invalidate(...)` on every namespace
+   whose data the write affects (including `DASHBOARD` and `REPORTS`).
+5. **Side effects** — `logActivity()` for the audit trail and `enqueue*()` for
+   notifications. Both are best-effort and never fail the request.
 
-## Project Structure
+### Why the worker is a separate process
+
+BullMQ workers hold a **blocking** Redis connection and poll continuously, which
+is incompatible with serverless functions that freeze between invocations and
+with `next dev` hot reloading. `worker/index.mjs` is therefore a standalone Node
+entrypoint (`npm run worker`). It imports the *same* job handler modules as the
+web app, so brokered and inline execution can never diverge.
+
+### Job handlers are dependency-injected
+
+`src/lib/jobs/*.jobs.mjs` are plain ESM modules with **no imports of their own**;
+Prisma is injected as `{ prisma }`. This lets the exact same file be consumed by
+the bundled Next.js runtime (where `@/lib/prisma` resolves) and by plain Node in
+the worker (no bundler, no path aliases).
+
+
+## Getting started
+
+### Prerequisites
+
+- **Node.js ≥ 18.18.0** (Node 20 recommended; the Docker image uses `node:20-bookworm-slim`)
+- **PostgreSQL 13+** (a free Neon / Supabase / Railway instance works)
+- *Optional:* **Redis 6+** — only needed for brokered jobs, a shared cache and
+  cross-instance rate limiting
+- *Optional:* **Docker** for container builds
+
+### 1. Install dependencies
+
+```bash
+cd my-app
+npm install
+```
+
+`postinstall` runs `prisma generate`, which needs a *syntactically valid*
+`DATABASE_URL` in the environment (no connection is made). Create `.env` first
+(step 2) or export a placeholder.
+
+### 2. Create `.env`
+
+```bash
+cat > .env <<'EOF'
+# --- Required -------------------------------------------------------------
+DATABASE_URL="postgresql://user:password@localhost:5432/bus_scheduling?schema=public"
+JWT_SECRET="replace-with-a-long-random-string"
+EOF
+```
+
+See [Environment variables](#environment-variables) for the full list.
+
+### 3. Apply the database schema
+
+```bash
+npm run prisma:migrate     # prisma migrate deploy  (recommended, reproducible)
+# or, during early prototyping:
+npm run prisma:push        # prisma db push
+```
+
+Inspect data with `npm run prisma:studio`.
+
+### 4. Create the first administrator
+
+Public registration is deliberately restricted to `PASSENGER` and `DRIVER`
+(`PUBLIC_REGISTER_ROLES`), so the first admin must be inserted directly:
+
+```bash
+node -e "
+const bcrypt = require('bcryptjs');
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
+(async () => {
+  await prisma.user.create({
+    data: {
+      email: 'admin@campus.edu',
+      password: await bcrypt.hash('ChangeMe123!', 12),
+      name: 'System Administrator',
+      role: 'ADMIN',
+    },
+  });
+  console.log('admin created');
+  await prisma.\$disconnect();
+})();
+"
+```
+
+> Change the password immediately after first login. The bcrypt cost factor is
+> **12** everywhere (`/api/auth/register`, `/api/users`, and the snippet above).
+
+### 5. Run
+
+```bash
+npm run dev        # http://localhost:3000
+```
+
+Optional, in a second terminal (only when `REDIS_URL` is set):
+
+```bash
+npm run worker
+```
+
+### 6. Production build
+
+```bash
+npm run build      # prisma generate && next build
+npm start          # next start
+```
+
+---
+
+## Environment variables
+
+All variables are read from `process.env`. Variables described as **lazy** are
+resolved at call time rather than module load, so platform/container injection is
+always picked up and `next build` can safely import the module.
+
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | **Yes** | — | PostgreSQL connection string used by Prisma (`env("DATABASE_URL")` in `prisma/schema.prisma`). |
+| `JWT_SECRET` | **Yes in production** | dev-only fallback | Signs and verifies session tokens. In `NODE_ENV=production` a missing value throws on first use — fail fast rather than issue forgeable tokens. |
+| `JWT_EXPIRES_IN` | No | `7d` | Token lifetime (any `jsonwebtoken` duration string). |
+| `REDIS_URL` | No | *unset* | Enables the Redis-backed cache + rate limiter and the BullMQ queues. **Unset = fully functional degraded mode.** |
+| `REDIS_DEBUG` | No | `false` | Set to `'true'` to log Redis connection errors. |
+| `CACHE_TTL_SECONDS` | No | `60` | Fallback TTL for namespaces without an explicit TTL. |
+| `CACHE_MEMORY_MAX_ENTRIES` | No | `500` | Upper bound on the in-process fallback cache (FIFO eviction). |
+| `QUEUE_ENQUEUE_TIMEOUT_MS` | No | `2000` | How long to wait for `queue.add()` before falling back to inline execution. |
+| `NEXT_PUBLIC_API_URL` | No | `''` (same origin) | Only set this if the API lives on a different origin than the UI. |
+| `NODE_ENV` | No | — | `production` tightens JWT handling and disables the Prisma global cache. |
+
+Build-time-only variables baked into the Docker image and overridden at runtime:
+`DATABASE_URL`, `JWT_SECRET`, `NEXT_TELEMETRY_DISABLED`, `PORT`, `HOSTNAME`.
+
+---
+
+## npm scripts
+
+| Script | Command | Description |
+| --- | --- | --- |
+| `npm run dev` | `next dev` | Development server with hot reload. |
+| `npm run build` | `prisma generate && next build` | Production build (emits `.next/standalone`). |
+| `npm run vercel-build` | `prisma generate && prisma migrate deploy && next build` | Build hook used by Vercel; applies pending migrations before building. |
+| `npm start` | `next start` | Serve the production build. |
+| `npm run worker` | `node worker/index.mjs` | Start the BullMQ worker (exits cleanly if `REDIS_URL` is unset). |
+| `npm run lint` | `next lint` | ESLint with `next/core-web-vitals`. |
+| `npm test` | `vitest run` | Full suite, single run. |
+| `npm run test:watch` | `vitest` | Watch mode. |
+| `npm run test:unit` | `vitest run tests/unit` | Unit suites only. |
+| `npm run test:e2e` | `vitest run tests/e2e` | Route-handler (integration) suites only. |
+| `npm run test:coverage` | `vitest run --coverage` | Coverage report (`text`, `html`, `lcov` → `./coverage`). |
+| `postinstall` | `prisma generate` | Runs automatically after `npm install`. |
+| `npm run prisma:generate` | `prisma generate` | Regenerate the Prisma client. |
+| `npm run prisma:push` | `prisma db push` | Sync schema without a migration file. |
+| `npm run prisma:migrate` | `prisma migrate deploy` | Apply committed migrations. |
+| `npm run prisma:studio` | `prisma studio` | Visual database browser. |
+
+---
+
+
+## Project structure
 
 ```
 my-app/
 ├── prisma/
-│   ├── schema.prisma             # Data model (models + enums)
-│   └── migrations/               # SQL migration history
+│   ├── schema.prisma                 # Models, enums, generator + datasource
+│   └── migrations/                   # Ordered SQL migrations
+├── public/                           # Static assets served at /
 ├── src/
-│   ├── app/                      # Next.js App Router
-│   │   ├── api/                  # REST route handlers
-│   │   │   ├── auth/             #   login, register, me
-│   │   │   ├── users/            #   users + [id]
-│   │   │   ├── buses/            #   buses + [id]
-│   │   │   ├── routes/           #   routes + [id]
-│   │   │   ├── stops/            #   stops + [id]
-│   │   │   ├── schedules/        #   schedules + [id]
-│   │   │   ├── trips/            #   trips + [id]
-│   │   │   ├── bookings/         #   bookings + [id]
-│   │   │   ├── buspass/          #   bus passes + QR verify
-│   │   │   ├── assignments/      #   driver ↔ bus assignment
-│   │   │   ├── maintenance/      #   maintenance records
-│   │   │   ├── notifications/    #   notifications
-│   │   │   ├── feedback/         #   feedback
-│   │   │   ├── activity-logs/    #   audit trail
-│   │   │   ├── reports/          #   analytics
-│   │   │   └── dashboard/        #   stats + emergency broadcast
-│   │   ├── activity-logs/        # Audit log page
-│   │   ├── assignments/          # Driver assignment page
-│   │   ├── bookings/             # Bookings page
-│   │   ├── buses/                # Buses page
-│   │   ├── buspass/              # Bus passes / verify page
-│   │   ├── dashboard/            # Dashboard + error boundary
-│   │   ├── feedback/             # Feedback page
-│   │   ├── login/                # Login page
-│   │   ├── maintenance/          # Maintenance page
-│   │   ├── notifications/        # Notifications page
-│   │   ├── profile/              # Profile page
-│   │   ├── register/             # Registration page
-│   │   ├── reports/              # Reports page
-│   │   ├── routes/               # Routes page
-│   │   ├── schedules/            # Schedules page
-│   │   ├── stops/                # Stops page
-│   │   ├── tracking/             # Live tracking page
-│   │   ├── trips/                # Trips page
-│   │   ├── users/                # Users page
-│   │   ├── layout.js             # Root layout (fonts, providers)
-│   │   ├── providers.js          # AuthProvider + AppProvider
-│   │   ├── page.js               # Landing page
-│   │   ├── loading.js            # Route loading state
-│   │   ├── error.js              # Global error boundary
-│   │   ├── not-found.js          # 404 page
-│   │   └── globals.css           # Tailwind import + custom styles
+│   ├── app/
+│   │   ├── api/                      # Route handlers (the REST API)
+│   │   │   ├── activity-logs/route.js
+│   │   │   ├── assignments/route.js
+│   │   │   ├── auth/{login,register,me}/route.js
+│   │   │   ├── bookings/{route.js,[id]/route.js}
+│   │   │   ├── buses/{route.js,[id]/route.js}
+│   │   │   ├── buspass/route.js
+│   │   │   ├── dashboard/route.js
+│   │   │   ├── feedback/route.js
+│   │   │   ├── health/{route.js,live/route.js}
+│   │   │   ├── maintenance/route.js
+│   │   │   ├── notifications/route.js
+│   │   │   ├── reports/route.js
+│   │   │   ├── routes/{route.js,[id]/route.js}
+│   │   │   ├── schedules/{route.js,[id]/route.js}
+│   │   │   ├── stops/{route.js,[id]/route.js}
+│   │   │   ├── trips/{route.js,[id]/route.js}
+│   │   │   └── users/{route.js,[id]/route.js}
+│   │   ├── activity-logs/page.js     # Admin audit-trail viewer
+│   │   ├── assignments/page.js       # Admin driver↔bus assignment
+│   │   ├── bookings/page.js          # Bookings (create/cancel/manage)
+│   │   ├── buses/page.js             # Fleet CRUD
+│   │   ├── buspass/page.js           # Passes + QR verification
+│   │   ├── dashboard/page.js         # Role-aware dashboard
+│   │   ├── feedback/page.js          # Feedback list + submit
+│   │   ├── login/page.js             # Sign in
+│   │   ├── maintenance/page.js       # Work orders
+│   │   ├── notifications/page.js     # Notification centre
+│   │   ├── profile/page.js           # Own profile
+│   │   ├── register/page.js          # Self-registration
+│   │   ├── reports/page.js           # Analytics
+│   │   ├── routes/page.js            # Route CRUD
+│   │   ├── schedules/page.js         # Timetable CRUD
+│   │   ├── stops/page.js             # Stop CRUD (map picker)
+│   │   ├── tracking/page.js          # Live map
+│   │   ├── trips/page.js             # Trip dispatch + driver controls
+│   │   ├── users/page.js             # User administration
+│   │   ├── layout.js                 # Root layout, fonts, metadata
+│   │   ├── providers.js              # AuthProvider + AppProvider
+│   │   ├── page.js                   # Public landing page
+│   │   ├── loading.js / error.js / not-found.js
+│   │   └── globals.css               # Tailwind v4 + design tokens
 │   ├── components/
-│   │   ├── ui/                   # Button, Input, Select, Card, Modal, Badge, Alert, LoadingSpinner (+ barrel)
-│   │   ├── layout/               # Sidebar, Navbar, DashboardLayout
-│   │   ├── map/                  # MapView, LocationPicker (+ barrel)
-│   │   └── QRVerifier.js         # Camera QR scanner component
-│   ├── context/                  # AuthContext, AppContext
-│   ├── hooks/                    # useRateLimit (live countdown UI state)
-│   ├── lib/                      # prisma, activityLogger, redis, cache, rateLimiter, queue, enqueue
-│   │   └── jobs/                 # BullMQ job handlers (*.jobs.mjs, Prisma injected)
-│   ├── middleware/               # authMiddleware, optionalAuth
-│   ├── services/                 # axios client + per-resource API services
-│   └── utils/                    # jwt helpers, clientRateLimit
-├── worker/                       # Standalone BullMQ worker (npm run worker)
-├── tests/                        # Vitest unit + end-to-end suites
-├── Dockerfile                    # Multi-stage image (web server + worker)
-├── .dockerignore
-├── .env
-├── next.config.mjs
-├── postcss.config.mjs
-├── vercel.json
+│   │   ├── layout/{DashboardLayout,Navbar,Sidebar}.js
+│   │   ├── map/{MapView,LocationPicker}.js
+│   │   ├── ui/{Button,Input,Select,Card,Modal,Badge,Alert,LoadingSpinner}.js
+│   │   ├── ui/index.js               # Barrel export
+│   │   └── QRVerifier.js             # Camera QR scanner
+│   ├── context/{AuthContext,AppContext}.js
+│   ├── hooks/useRateLimit.js
+│   ├── lib/
+│   │   ├── prisma.js                 # Singleton PrismaClient
+│   │   ├── redis.js                  # Shared Redis + circuit breaker
+│   │   ├── cache.js                  # Versioned response cache
+│   │   ├── rateLimiter.js            # Lua fixed/sliding windows + fallback
+│   │   ├── queue.js                  # BullMQ producers + inline fallback
+│   │   ├── enqueue.js                # Intent-revealing job facade
+│   │   ├── activityLogger.js         # Audit-trail writer
+│   │   └── jobs/{notification,audit}.jobs.mjs
+│   ├── middleware/auth.js            # authMiddleware / optionalAuth
+│   ├── services/                     # One module per resource (axios)
+│   │   ├── client.js                 # Axios instance + interceptors
+│   │   └── {auth,bus,route,stop,schedule,trip,booking,busPass,user,
+│   │        notification,feedback,maintenance,report,dashboard,
+│   │        activityLog,assignment}Service.js
+│   └── utils/{jwt,dates,clientRateLimit}.js
+├── tests/
+│   ├── setup.js                      # Global env + reset hooks
+│   ├── helpers/{prismaMock,fakeRedis}.js
+│   ├── unit/                         # cache, queue, redis, rateLimiter, dates,
+│   │                                 # jobs, enqueue, clientRateLimit, coverage
+│   └── e2e/                          # health, healthLive, auth.login,
+│                                     # cacheRoutes, attendance
+├── worker/index.mjs                  # Standalone BullMQ worker
+├── Dockerfile                        # 3-stage build (deps → builder → runner)
+├── vercel.json                       # Build command, region, function limits
+├── next.config.mjs                   # standalone output, externals, webpack
+├── postcss.config.mjs                # Tailwind v4 via PostCSS
+├── vitest.config.mjs                 # ESM test runner config
+├── jsconfig.json                     # `@/*` → `./src/*` alias
+├── .eslintrc.json                    # next/core-web-vitals
 └── package.json
 ```
 
 
-## Data Model (Database Schema)
+## Data model
 
-PostgreSQL, defined in `prisma/schema.prisma`. IDs are `cuid()` strings; every
-model has `createdAt`/`updatedAt` unless noted.
+Schema source of truth: [`prisma/schema.prisma`](prisma/schema.prisma).
+Provider: **PostgreSQL**. Primary keys are Prisma `cuid()` strings.
 
 ### Enums
 
@@ -266,1063 +416,770 @@ model has `createdAt`/`updatedAt` unless noted.
 | `MaintenanceType` | `ROUTINE`, `REPAIR`, `BREAKDOWN`, `INSPECTION` |
 | `NotificationType` | `SCHEDULE_CHANGE`, `DELAY`, `EMERGENCY`, `BUS_ARRIVING`, `BOOKING_CONFIRMATION`, `BUS_PASS_CREATED`, `MAINTENANCE_CREATED`, `ROUTE_CREATED`, `TRIP_STARTED`, `FEEDBACK_RECEIVED`, `STOP_CREATED`, `TRIP_SCHEDULED` |
 
+> A migration (`20261009120000_rename_student_to_passenger`) renamed the
+> historical `STUDENT` enum value and the `studentId` columns to `PASSENGER` /
+> `passengerId`. The domain term throughout the codebase is **passenger**.
+
 ### Models
 
-| Model | Key fields | Relations |
+**`User`** — every actor in the system (admins, drivers, passengers share one table).
+
+| Field | Type | Notes |
 | --- | --- | --- |
-| **User** | `email` (unique), `password`, `name`, `phone?`, `role`, `passengerId?` (unique), `licenseNumber?`, `isActive` | `bookings`, `feedbacks`, `activityLogs`, `busPass?`, `bus?`, `trips` |
-| **Bus** | `busNumber` (unique), `plateNumber` (unique), `capacity`, `model?`, `year?`, `status`, `lastMaintenance?`, `fuelType`, `mileage`, `driverId?` (unique) | `driver? (User)`, `schedules`, `bookings`, `trips`, `maintenance` |
-| **Route** | `name`, `description?`, `isActive`, `estimatedDuration` (min), `distance` (km) | `stops`, `schedules`, `trips` |
-| **Stop** | `name`, `latitude`, `longitude`, `address?`, `order`, `isActive`, `routeId` | `route`, `bookings` |
-| **Schedule** | `routeId`, `busId`, `scheduleType`, `departureTime`, `arrivalTime`, `daysOfWeek` (String[]), `isActive`, `isSpecial`, `specialDate?`, `notes?` | `route`, `bus`, `trips` |
-| **Trip** | `scheduleId`, `busId`, `routeId`, `driverId`, `startTime`, `endTime?`, `status` (default `SCHEDULED`), `actualStartTime?`, `actualEndTime?` | `schedule`, `bus`, `route`, `driver`, `bookings`, `feedbacks` |
-| **Booking** | `userId`, `busId`, `stopId`, `tripId?`, `bookingDate`, `status`, `seatNumber?`, `qrCode?` (unique), `qrCodeData?`, `isUsed` | `user`, `bus`, `stop`, `trip?` |
-| **BusPass** | `passengerId` (unique), `passNumber` (unique), `startDate`, `endDate`, `isActive`, `qrCode?` (unique) | `passenger (User)` |
-| **Maintenance** | `busId`, `type`, `status`, `description`, `scheduledDate`, `completedDate?`, `cost?`, `notes?` | `bus` |
-| **Notification** | `userRole` (String), `link`, `type`, `title`, `message`, `isRead`, `sentAt` | — (targeted by role, not per-user) |
-| **Feedback** | `userId`, `tripId?`, `rating` (1–5), `comment?` | `user`, `trip?` |
-| **ActivityLog** | `userId`, `action`, `details?`, `ipAddress?`, `userAgent?` | `user` |
+| `id` | `String` | `@id @default(cuid())` |
+| `email` | `String` | `@unique` |
+| `password` | `String` | bcrypt hash, cost 12 |
+| `name`, `phone` | `String`, `String?` | |
+| `role` | `UserRole` | |
+| `passengerId` | `String?` | `@unique` — required for passengers |
+| `licenseNumber` | `String?` | required for drivers |
+| `isActive` | `Boolean` | `@default(true)` — deactivated users are rejected by `authMiddleware` |
+| `createdAt` / `updatedAt` | `DateTime` | |
 
-> **Design note:** a driver may be assigned to at most one bus (`Bus.driverId` is
-> `@unique`), enforcing a 1:1 driver↔bus relationship at the database level.
-> `Notification` rows are targeted by `userRole` rather than by individual user,
-> so one row serves every user of that role.
+Relations: `bookings[]`, `feedbacks[]`, `activityLogs[]`, `busPass?`, `bus?`
+(the bus this user drives — one-to-one), `trips[]`.
 
-## User Roles & Permissions
+**`Bus`** — `busNumber` (`@unique`), `plateNumber` (`@unique`), `capacity`,
+`model?`, `year?`, `status`, `lastMaintenance?`, `fuelType` (`@default("DIESEL")`),
+`mileage` (`@default(0)`), plus `driver?`/`driverId` (`@unique` — a driver may be
+assigned to at most one bus). Relations: `schedules[]`, `bookings[]`, `trips[]`,
+`maintenance[]`.
 
-### Administrator
-- Full system access.
-- User management (create, update, deactivate).
-- Route, stop and schedule creation; bus management.
-- Bus & driver assignment (one driver per bus).
-- Maintenance scheduling.
-- View all reports and analytics, activity logs.
-- Send emergency broadcasts.
-- Create/update/delete digital bus passes and verify passes.
+**`Route`** — `name`, `description?`, `isActive`, `estimatedDuration` (minutes),
+`distance` (km). Relations: `stops[]`, `schedules[]`, `trips[]`.
 
-### Driver
-- View assigned routes, schedules and trips.
-- Start / complete / cancel trip status (only for trips assigned to them).
-- Verify bus passes (QR scan or pass number) — records attendance.
-- View role notifications.
+**`Stop`** — `name`, `latitude`, `longitude`, `address?`, `order`, `isActive`;
+belongs to one `Route`.
 
-### Passenger
-- View routes and schedules; live tracking.
-- Make and manage their own bookings (create / cancel).
-- View their digital bus pass.
-- Provide trip feedback.
-- Receive notifications.
+**`Schedule`** — a recurring timetable entry: `routeId`, `busId`, `scheduleType`,
+`departureTime`, `arrivalTime`, `daysOfWeek` (`String[]`, e.g.
+`["MON","TUE"]`), `isActive`, `isSpecial`, `specialDate?`, `notes?`.
+Relations: `trips[]`.
 
-## Frontend Documentation
+**`Trip`** — an actual run of a schedule: `scheduleId`, `busId`, `routeId`,
+`driverId`, `startTime`, `endTime?`, `status` (`String`, default
+`"SCHEDULED"`; also `IN_PROGRESS`, `COMPLETED`, `CANCELLED`),
+`actualStartTime?`, `actualEndTime?`. Relations: `bookings[]`, `feedbacks[]`.
 
-### App Router Pages
+**`Booking`** — `userId`, `busId`, `stopId`, `tripId?`, `bookingDate`,
+`status` (`BookingStatus`, default `PENDING`), `seatNumber?`,
+`qrCode?` (`@unique`, PNG data URL), `qrCodeData?` (raw UUID payload),
+`isUsed` (`@default(false)` — set to `true` when a driver verifies the pass).
 
-All pages are **client components** (`'use client'`) that fetch data through the
-service layer and render inside `DashboardLayout` (except auth/landing pages).
+**`BusPass`** — `passengerId` (`@unique`), `passNumber` (`@unique`),
+`startDate`, `endDate`, `isActive`, `qrCode?` (`@unique`).
 
-| Route | File | Description | Roles |
-| --- | --- | --- | --- |
-| `/` | `app/page.js` | Landing page; shows Login/Register or a "Go to Dashboard" shortcut if a session exists. | Public |
-| `/login` | `app/login/page.js` | Email/password sign-in form. On success routes to `/dashboard`. | Public |
-| `/register` | `app/register/page.js` | Self-registration (role-limited to Passenger/Driver). | Public |
-| `/dashboard` | `app/dashboard/page.js` | Role-aware dashboard: admin stats, recent trips, schedules, maintenance alerts. | All |
-| `/buses` | `app/buses/page.js` | Bus list + create/edit/delete (admin). | All (write: admin) |
-| `/routes` | `app/routes/page.js` | Route list with stops + create/edit/deactivate. | All (write: admin) |
-| `/stops` | `app/stops/page.js` | Stop management with map location picking. | All (write: admin) |
-| `/schedules` | `app/schedules/page.js` | Schedule CRUD with day-of-week & type. | All (write: admin) |
-| `/trips` | `app/trips/page.js` | Trip list; start/complete/cancel; create from schedule. | All (write: admin/driver) |
-| `/tracking` | `app/tracking/page.js` | Live map of stops + user location; polls every 30 s. | All |
-| `/bookings` | `app/bookings/page.js` | Booking management; passengers see only their own. | All |
-| `/buspass` | `app/buspass/page.js` | Passenger pass view / admin management / driver QR verify. | All |
-| `/assignments` | `app/assignments/page.js` | Assign/unassign drivers to buses. | Admin |
-| `/maintenance` | `app/maintenance/page.js` | Maintenance records CRUD + complete. | Admin |
-| `/notifications` | `app/notifications/page.js` | Role notifications list; mark read/delete. | All |
-| `/feedback` | `app/feedback/page.js` | Submit/view feedback (passenger) with ratings. | All |
-| `/reports` | `app/reports/page.js` | Analytics: daily summary, bus usage, driver performance, fuel. | Admin |
-| `/activity-logs` | `app/activity-logs/page.js` | Paginated audit trail. | Admin |
-| `/users` | `app/users/page.js` | User CRUD + deactivate + search. | Admin |
-| `/profile` | `app/profile/page.js` | View/update own name & phone; change password. | All |
+**`Maintenance`** — `busId`, `type`, `status`, `description`,
+`scheduledDate`, `completedDate?`, `cost?`, `notes?`.
 
-**Special app files**
-- `app/layout.js` — root layout: loads Inter font, sets metadata/viewport, wraps children in `<Providers>`.
-- `app/providers.js` — composes `AuthProvider` (outer) and `AppProvider` (inner).
-- `app/loading.js` — global route loading spinner.
-- `app/error.js` — global error boundary with a reset button.
-- `app/not-found.js` — 404 page.
-- `app/dashboard/error.js` — dashboard-scoped error boundary.
+**`Notification`** — role-targeted, **not** per-user: `userRole` (string),
+`link`, `type`, `title`, `message`, `isRead`, `sentAt`. A broadcast writes one
+row per role inside a single transaction.
 
+**`Feedback`** — `userId`, `tripId?`, `rating` (1–5), `comment?`.
 
-### Layout & Navigation Components
+**`ActivityLog`** — audit trail: `userId`, `action` (e.g. `CREATE_BUS`,
+`LOGIN`, `VERIFY_BUS_PASS`, `EMERGENCY_BROADCAST`), `details?`, `ipAddress?`,
+`userAgent?`, `createdAt`.
 
-**`DashboardLayout`** (`components/layout/DashboardLayout.js`)
-- Client component wrapping every authenticated page.
-- Redirects unauthenticated users to `/login` (in an effect, never during render).
-- Shows a full-screen loader while `loading || !isAuthenticated`.
-- Renders `<Sidebar>` + `<Navbar>` and a scrollable `<main>`.
-- Keys the content wrapper on `pathname` so a `page-enter` animation replays per route.
-- Closes the mobile sidebar whenever the route changes.
+### Migration history
 
-**`Sidebar`** (`components/layout/Sidebar.js`)
-- Fixed slide-in drawer on mobile, static on `lg`.
-- Builds role-specific nav link arrays (`adminLinks`, `driverLinks`, `passengerLinks`).
-- Highlights the active link; sets `aria-current="page"`.
-- Shows the user avatar, name and role at the bottom.
-
-**`Navbar`** (`components/layout/Navbar.js`)
-- Sticky, blurred, `z-30` header.
-- Hamburger (`onMenuClick`) to open the mobile sidebar.
-- Notification bell dropdown: fetches the latest 5 notifications, shows an unread
-  badge, supports per-item "mark as read".
-- User dropdown: Profile link + Logout; closes on outside click (`mousedown` listener).
-
-### UI Component Library
-
-Re-exported from `components/ui/index.js`. All are client components.
-
-| Component | Props (highlights) | Notes |
-| --- | --- | --- |
-| `Button` | `variant` (`primary`/`secondary`/`success`/`danger`/`warning`/`outline`/`ghost`), `size` (`sm`/`md`/`lg`), `loading`, `disabled` | Inline spinner while loading; visible focus ring; `active:scale-[0.98]`. |
-| `Input` | `label`, `name`, standard input props, password toggle | Forwards attributes to `<input>`. |
-| `Select` | `label`, `options`, `name` | Themed native select with chevron icon. |
-| `Card` | `title`, `children`, etc. | Rounded surface with soft shadow. |
-| `Modal` | `isOpen`, `onClose`, `title` | Escape-to-close, backdrop click, focus handling. |
-| `Badge` | `variant`, `children` | Status pills with color variants. |
-| `Alert` | `variant` (`info`/`success`/`warning`/`danger`) | Icon + message banner. |
-| `LoadingSpinner` | `size`, `className` | Accessible loading indicator. |
-
-### Map Components
-
-Re-exported from `components/map/index.js`. Both are client components that
-**dynamically import** `react-leaflet` with `ssr: false` (Leaflet needs `window`).
-
-**`MapView`** (`components/map/MapView.js`)
-- Props: `stops`, `center`, `zoom`, `height`, `onMapClick`.
-- Watches the user position with `getCurrentPosition` + `watchPosition`.
-- Draws a dashed polyline from the user to each stop, a user marker and stop markers.
-- Popups show stop name, address, order, route and **Haversine distance** to the user.
-- Uses OpenStreetMap tiles; shows a "Loading Map…" placeholder until geolocation resolves.
-
-**`LocationPicker`** (`components/map/LocationPicker.js`)
-- Used where admins pick stop coordinates.
-- Dynamically loads Leaflet + react-leaflet and patches default marker icons from CDN.
-- `useMapEvents` handles clicks; `onChange([lat, lng])` reports the selection.
-- Renders the user marker, selected marker and connecting polylines with distances.
-
-**`QRVerifier`** (`components/QRVerifier.js`)
-- Props: `onVerify(text)`, `verifyResult`, `onReset()`.
-- Uses `html5-qrcode` to scan QR codes (environment-facing camera).
-- Guards against double-start (StrictMode), releases the camera on unmount, and maps
-  common camera errors (permission denied, not available, already in use) to friendly messages.
-- Renders a green success card (pass number, passenger name/ID, valid-until) or a
-  red failure card.
-
-
-### State Management (Contexts)
-
-**`AuthContext`** (`context/AuthContext.js`)
-- Holds `user`, `loading`, `error`.
-- On mount, **re-validates** the stored session: optimistically restores the cached
-  user, then calls `authService.getSession()`; clears the session if invalid.
-- Exposes `login`, `register`, `logout` and derived flags:
-  `isAuthenticated`, `isAdmin`, `isDriver`, `isPassenger`.
-- `useAuth()` throws if used outside the provider.
-
-**`AppContext`** (`context/AppContext.js`)
-- Holds shared collections: `notifications`, `unreadCount`, `dashboardStats`,
-  `buses`, `routes`, `schedules`, `trips`, plus per-collection `loading` flags.
-- Provides `fetchNotifications`, `markNotificationsAsRead`, `fetchDashboardStats`,
-  `fetchBuses`, `fetchRoutes`, `fetchSchedules`, `fetchTrips`.
-- `useApp()` throws if used outside the provider.
-
-### API Service Layer
-
-`services/client.js` creates a single axios instance:
-
-- `baseURL = process.env.NEXT_PUBLIC_API_URL || ''` (same-origin on Vercel).
-- **Request interceptor** attaches `Authorization: Bearer <token>` from `localStorage`.
-- **Response interceptor** clears the session and redirects to `/login` on `401`.
-
-Per-resource services export a namespaced object that wraps the endpoints. `authService`
-also manages token/user persistence in `localStorage`.
-
-| Service | Methods |
+| Migration | Change |
 | --- | --- |
-| `authService` | `login`, `register`, `logout`, `getCurrentUser`, `getToken`, `getSession` |
-| `userService` | `getAll`, `getById`, `create`, `update`, `delete` |
-| `busService` | `getAll`, `getById`, `create`, `update`, `delete` |
-| `routeService` | `getAll`, `getById`, `create`, `update`, `delete` |
-| `stopService` | `getAll`, `getById`, `create`, `update`, `delete` |
-| `scheduleService` | `getAll`, `getById`, `create`, `update`, `delete` |
-| `tripService` | `getAll`, `getById`, `create`, `update`, `delete` |
-| `bookingService` | `getAll`, `getById`, `create`, `cancel`, `confirm`, `update`, `delete` |
-| `busPassService` | `getAll`, `create`, `update`, `delete`, `verify` |
-| `assignmentService` | `getAll`, `assign`, `unassign` |
-| `maintenanceService` | `getAll`, `create`, `update`, `delete` |
-| `notificationService` | `getAll`, `create`, `markAsRead`, `delete`, `deleteById`, `deleteAllRead` |
-| `feedbackService` | `getAll`, `create` |
-| `activityLogService` | `getAll` |
-| `dashboardService` | `getStats`, `sendEmergencyBroadcast` |
-| `reportService` | `getDashboard`, `getDailySummary`, `getBusUsage`, `getDriverPerformance`, `getFuelConsumption` |
-
-All list methods accept a `params` object forwarded as query string.
-
-### Styling & Design System
-
-- **TailwindCSS v4** imported in `app/globals.css` via `@import "tailwindcss";` and
-  compiled through PostCSS (`postcss.config.mjs` with `@tailwindcss/postcss`).
-- **Palette**: slate backgrounds (`bg-slate-950`/`900`), blue primary accents,
-  emerald/amber/red for status. Rounded surfaces, soft shadows, blurred sticky header.
-- **Font**: Inter via `next/font/google`, exposed as `--font-inter`.
-- **Custom utilities/animations** in `globals.css`: `page-enter`, `animate-slide-up`,
-  `animate-scale-in`.
-- **Accessibility**: `focus-visible` rings, ARIA labels (`aria-current`, `aria-label`),
-  Escape-to-close modals, click-outside dropdowns, `prefers-reduced-motion` support.
-
-### Client-Side Authentication Flow
-
-1. `AuthProvider` mounts → reads cached `user` from `localStorage` → optimistically sets it.
-2. Calls `authService.getSession()` → `GET /api/auth/me` with the bearer token.
-3. Valid → fresh user stored; invalid/expired → `logout()` clears storage and `user`.
-4. `DashboardLayout` redirects to `/login` if `!isAuthenticated` after loading.
-5. Any `401` from the API interceptor also clears storage and redirects to `/login`.
-
-
-## Backend Documentation
-
-### API Conventions
-
-- Every handler module sets `export const runtime = 'nodejs'` and
-  `export const dynamic = 'force-dynamic'`.
-- All endpoints require `Authorization: Bearer <token>` **except**
-  `POST /api/auth/login` and `POST /api/auth/register`.
-- Handlers begin with `const authResult = await authMiddleware(req, [roles])` and
-  short-circuit with `if (authResult instanceof NextResponse) return authResult;`.
-- Success responses use `NextResponse.json({...})`; errors use
-  `NextResponse.json({ error }, { status })` with meaningful status codes
-  (`400`, `401`, `403`, `404`, `409`, `500`).
-- Writes validate required fields, enums, numeric ranges, dates and foreign-key
-  existence before touching the database.
-
-### Authentication & Middleware
-
-`middleware/auth.js` exports:
-
-**`authMiddleware(req, roles = [])`**
-1. Reads the `Authorization` header; requires the `Bearer ` prefix (else `401`).
-2. Verifies the token via `verifyToken` (else `401`).
-3. Loads the user by `decoded.userId` (else `401`); checks `isActive` (else `403`).
-4. If `roles` is non-empty and the user's role isn't included → `403`.
-5. Returns `{ user }` on success or a `NextResponse` error otherwise.
-
-**`optionalAuth(req)`** — returns `{ user: null }` instead of erroring when the
-token is missing/invalid.
-
-`utils/jwt.js`:
-- `generateToken(payload)` signs with `JWT_SECRET`, expiry `JWT_EXPIRES_IN` (default `7d`).
-- `verifyToken(token)` returns the decoded payload or `null`.
-- `decodeToken(token)` — non-verifying decode.
-- The secret is resolved lazily: in **production** a missing `JWT_SECRET` throws;
-  in development a fallback secret is used so builds succeed.
-
-### Audit Logging
-
-`lib/activityLogger.js` exports `logActivity({ userId, action, details, req })`:
-- Extracts `ipAddress` from `x-forwarded-for` / `x-real-ip` and `userAgent` from headers.
-- Writes an `ActivityLog` row.
-- **Never throws** — a logging failure must not break the primary request.
-
-Actions recorded include: `LOGIN`, `REGISTER`, `CREATE_USER`, `CREATE_BUS`,
-`CREATE_ROUTE`, `CREATE_SCHEDULE`, `CREATE_STOP`, `CREATE_BUS_PASS`,
-`UPDATE_BUS_PASS`, `DELETE_BUS_PASS`, `VERIFY_BUS_PASS`, `UPDATE_TRIP`,
-`DELETE_TRIP`, `UPDATE_BOOKING`, `DELETE_BOOKING`, `ASSIGN_DRIVER`,
-`UNASSIGN_DRIVER`, `CREATE_MAINTENANCE`, `UPDATE_MAINTENANCE`,
-`DELETE_MAINTENANCE`, `SUBMIT_FEEDBACK`, `EMERGENCY_BROADCAST`.
-
-`lib/prisma.js` exports a singleton `PrismaClient` (stored on `global` in
-non-production to survive hot reloads), logging errors only.
-
-### API Endpoint Reference
-
-All paths are relative to `/api`. The **Auth** column lists permitted roles.
-
-#### Authentication
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| POST | `/auth/login` | Public | Validate credentials, return `token` + `user`. |
-| POST | `/auth/register` | Public | Register as `PASSENGER`/`DRIVER` only; returns `token` + `user`. |
-| GET | `/auth/me` | All | Validate bearer token, return current `user`. |
-
-#### Users
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/users` | Admin | List users (filters: `role`, `isActive`). |
-| POST | `/users` | Admin | Create user (any role). |
-| GET | `/users/[id]` | All | Get user details. |
-| PUT | `/users/[id]` | All/Admin | Update user (self or admin). |
-| DELETE | `/users/[id]` | Admin | Deactivate user. |
-
-#### Buses
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/buses` | All | List buses (filter `?status=`), incl. driver + schedules. |
-| POST | `/buses` | Admin | Create bus (validates capacity, unique number/plate). |
-| GET | `/buses/[id]` | All | Get bus details. |
-| PUT | `/buses/[id]` | Admin | Update bus. |
-| DELETE | `/buses/[id]` | Admin | Delete bus. |
-
-#### Routes
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/routes` | All | List routes incl. stops, counts (filter `?isActive=`). |
-| POST | `/routes` | Admin | Create route (optionally with nested stops). |
-| GET | `/routes/[id]` | All | Get route details. |
-| PUT | `/routes/[id]` | Admin | Update route (cannot replace stops with existing bookings). |
-| DELETE | `/routes/[id]` | Admin | Deactivate route. |
-
-#### Stops
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/stops` | All | List stops (optionally `?routeId=`). |
-| POST | `/stops` | Admin | Create stop (validates lat/lng range, route exists; auto-order). |
-| GET | `/stops/[id]` | All | Get stop details. |
-| PUT | `/stops/[id]` | Admin | Update stop. |
-| DELETE | `/stops/[id]` | Admin | Delete / deactivate stop. |
-
-#### Schedules
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/schedules` | All | List schedules (filters: `routeId`, `busId`, `scheduleType`, `isActive`, `isSpecial`). |
-| POST | `/schedules` | Admin | Create schedule (validates route/bus; supports `HH:mm` times; notifies passengers). |
-| GET | `/schedules/[id]` | All | Get schedule details. |
-| PUT | `/schedules/[id]` | Admin | Update schedule. |
-| DELETE | `/schedules/[id]` | Admin | Deactivate schedule. |
-
-#### Trips
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/trips` | All | List trips (filters: `routeId`, `busId`, `date`). |
-| POST | `/trips` | Admin/Driver | Start (create) a trip from a `scheduleId`; notifies passengers. |
-| GET | `/trips/[id]` | All | Get trip details. |
-| PUT | `/trips/[id]` | Admin/Owning Driver | Update status (`IN_PROGRESS`/`COMPLETED`/`CANCELLED`); terminal states enforced. |
-| DELETE | `/trips/[id]` | Admin | Delete trip (not if in progress). |
-
-#### Bookings
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/bookings` | All | List bookings (passengers see only their own; filters available). |
-| POST | `/bookings` | Admin/Passenger | Create booking; atomic seat allocation; QR generated. |
-| GET | `/bookings/[id]` | All | Get booking (passengers only their own). |
-| PUT | `/bookings/[id]` | Admin/Owning Passenger | Update/cancel (passengers can only cancel). |
-| DELETE | `/bookings/[id]` | Admin | Delete booking. |
-
-#### Bus Pass
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/buspass` | Admin/Passenger | List passes (passengers see their own; `?passengerId=` for admin). |
-| POST | `/buspass` | Admin | Create pass (validates role/date range; one active pass per passenger). |
-| PUT | `/buspass` | Admin/Driver | **Verify** a QR/pass number; marks today's bookings attended. |
-| PATCH | `/buspass` | Admin | Update pass dates/active flag. |
-| DELETE | `/buspass?id=` | Admin | Delete a pass. |
-
-#### Driver Assignments
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/assignments` | Admin | List buses with drivers + pool of unassigned drivers + stats. |
-| POST | `/assignments` | Admin | Assign a driver to a bus (both must be free). |
-| DELETE | `/assignments?busId=` | Admin | Unassign a driver from a bus. |
-
-#### Maintenance
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/maintenance` | Admin | List records (filters: `busId`, `status`, `type`). |
-| POST | `/maintenance` | Admin | Create record; sets bus to `MAINTENANCE` for repair/breakdown. |
-| PUT | `/maintenance` | Admin | Update status; on `COMPLETED` reactivates bus & stamps `lastMaintenance`. |
-| DELETE | `/maintenance?id=` | Admin | Delete a record. |
-
-#### Notifications
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/notifications` | All | List notifications for the caller's role (admin sees all) + `unreadCount`. |
-| POST | `/notifications` | Admin | Send a notification (by `userRole`, or to all roles). |
-| PUT | `/notifications` | All | Mark specific/all-read, or delete by ids (scoped by role). |
-| DELETE | `/notifications?id=` | Admin | Delete one, or all read when no `id`. |
-
-#### Feedback
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/feedback` | All | List feedback (admin sees all, others their own) + `averageRating`. |
-| POST | `/feedback` | Admin/Passenger | Submit feedback (rating 1–5; one per trip per user). |
-
-#### Activity Logs
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/activity-logs` | Admin | Paginated audit trail (`?page=&limit=`). |
-
-#### Reports
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/reports?type=…` | Admin | `daily-summary` \| `bus-usage` \| `driver-performance` \| `fuel-consumption` (default: overview). |
-
-#### Dashboard
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/dashboard` | Admin | Aggregate stats + recent trips + upcoming schedules + maintenance alerts. |
-| POST | `/dashboard` | Admin | Send an emergency broadcast to all roles. |
-
-#### Infrastructure
-
-| Method | Path | Auth | Description |
-| --- | --- | --- | --- |
-| GET | `/health/live` | Public | Liveness probe. Returns `{ status: 'ok' }`. No DB/Redis/auth work, so it cannot fail during a dependency outage. Used by the Docker `HEALTHCHECK`. |
-| GET | `/health` | Admin | Redis status, cache diagnostics, active rate-limit policies and queue depth (incl. `deliveryMode`). |
-
-### Backend Business Logic
-
-**Booking creation (overbooking protection)** — `POST /api/bookings`
-- Validates the trip exists and the selected stop belongs to the trip's route.
-- Rejects duplicate active bookings for the same user/trip/day (`409`).
-- Runs a `Serializable` transaction: counts confirmed bookings for the trip/day,
-  throws `NO_SEATS` if capacity is reached, otherwise generates a seat number
-  (`1A`–`nD`) and a UUID QR data-URL, then inserts the booking as `CONFIRMED`.
-- Notifies drivers of the new booking.
-
-**Pass verification + attendance** — `PUT /api/buspass`
-- Finds an active, non-expired pass by `passNumber` (or scanned value).
-- `updateMany` marks today's `CONFIRMED`/`COMPLETED` bookings for that passenger
-  with `isUsed: false` → `isUsed: true`.
-- Returns `valid`, pass summary and `attendance.marked` count. Logs `VERIFY_BUS_PASS`.
-
-**Trip lifecycle** — `PUT /api/trips/[id]`
-- Drivers may only update trips assigned to them.
-- Statuses limited to `SCHEDULED`/`IN_PROGRESS`/`COMPLETED`/`CANCELLED`.
-- `COMPLETED`/`CANCELLED` are terminal; setting `IN_PROGRESS` stamps
-  `actualStartTime`, `COMPLETED` stamps `endTime`/`actualEndTime`.
-
-**Maintenance ↔ bus status**
-- Creating a `REPAIR`/`BREAKDOWN` record sets the bus to `MAINTENANCE`.
-- Completing a record sets the bus back to `ACTIVE` and stamps `lastMaintenance`.
-
-**Notifications** are stored per role. Creation sites include: routes, stops,
-schedules, trips, bookings (driver), bus passes, maintenance, feedback (admin),
-driver assignment and broadcasts.
-
-## How Attendance Works
-
-Attendance is driven entirely by **driver pass verification** (no manual marking):
-
-1. A passenger books a trip — the booking is created with attendance unmarked.
-2. When boarding, the driver opens **Bus Passes → Verify Pass** and scans the
-   passenger's QR code (or types the pass number).
-3. `PUT /api/buspass` validates the pass and marks the passenger's **active
-   booking for the current day** as attended (`Booking.isUsed = true`).
-4. The driver sees a confirmation ("Attendance recorded for N booking(s) today.").
-5. **Reports → Daily Summary → Attendance Summary** displays Total / Present /
-   Absent / Attendance Rate from that data.
-
-### The read and write paths must agree
-
-`Present` is only non-zero when the query used to *count* attendance matches the
-one used to *record* it. Three things have to line up:
-
-| | Write (`PUT /api/buspass`) | Read (`GET /api/reports?type=daily-summary`) |
-| --- | --- | --- |
-| Date field | `bookingDate` | `bookingDate` |
-| Window | `gte: startOfDay()`, `lt: startOfNextDay()` | `gte`/`lte` of `dayRange()` |
-| Status | `CONFIRMED`, `COMPLETED` | `CONFIRMED`, `COMPLETED` |
-| `isUsed` | filtered to `false`, then set `true` | counted where `true` |
-
-Two failure modes worth knowing about, both of which make attendance read as
-`0%` even though it was recorded:
-
-- **Filtering the report by `tripId`.** `Booking.tripId` is **optional** in the
-  schema, so a booking created without a trip is invisible to a
-  `tripId IN (…)` filter. The report now filters on `bookingDate` instead.
-- **A stale cache.** Recording attendance must call
-  `invalidate(CACHE_NAMESPACES.REPORTS)`, otherwise the 60s reports TTL keeps
-  serving the pre-verification numbers.
-
-### Date handling
-
-All day windows go through `src/utils/dates.js` rather than ad-hoc `Date`
-arithmetic, because two very common mistakes silently shift a window by a day:
-
-- `new Date('2026-02-16')` parses as **UTC** midnight, while `setHours(0,0,0,0)`
-  is **local**. Use `parseDateOnly()` to get local midnight for a date-only
-  string.
-- `date.toISOString().split('T')[0]` returns the **UTC** calendar date, which is
-  the previous day for local times earlier than the UTC offset. Use
-  `toLocalDateKey()`.
-
-Helpers available: `startOfDay`, `endOfDay`, `startOfNextDay`, `dayRange`,
-`toLocalDateKey`, `parseDateOnly`. Prefer an exclusive upper bound
-(`lt: startOfNextDay()`) over `lte: endOfDay()` so the final millisecond of a day
-is never excluded.
-
-
-## Notifications
-
-- Notifications are **role-targeted** (`Notification.userRole`), not per-user.
-- `GET /api/notifications` returns the caller's role's notifications; admins see all.
-- Each response includes an `unreadCount`; the Navbar badge and bell dropdown use it.
-- `PUT /api/notifications` marks items read or deletes them, always scoped to the
-  caller's role (admins may act on any).
-- Types are validated against the `NotificationType` enum on `POST`.
-
-## Security Notes
-
-- **Admin provisioning**: public `/api/auth/register` is restricted server-side to
-  `PASSENGER` and `DRIVER`. Admin accounts are created by an existing admin through
-  `POST /api/users`.
-- **Password hashing**: bcrypt with a cost factor of 12.
-- **JWT**: `JWT_SECRET` is **required in production** — the app refuses to sign or
-  verify tokens without it. Sessions are re-validated on load via `GET /api/auth/me`,
-  so expired/deactivated sessions are cleared automatically.
-- **Authorization**: every API route enforces role checks through `authMiddleware`;
-  passengers can only read/modify their own bookings, feedback and bus passes.
-- **Booking integrity**: seat allocation runs inside a `Serializable` transaction to
-  prevent overbooking under concurrency.
-- **Audit trail**: every mutating action is written to `ActivityLog` with actor, IP
-  address and user agent.
-- **Input validation**: all write endpoints validate required fields, enums, numeric
-  ranges, dates and foreign-key existence before touching the database.
-- **Rate limiting**: every endpoint is protected by a manual, Redis-backed
-  limiter (see [Redis, BullMQ & Rate Limiting](#redis-bullmq--rate-limiting)).
-  Credential endpoints are capped per IP **and** per email.
+| `20260216080149_init_db` | Initial schema (with `Driver`/`Student` profile tables, `Attendance`, `BusLocation`, `StopTime`, `TripStop`, `FuelRecord`). |
+| `20260217061752_update_trips` | Unique index on `Trip.driverId`. |
+| `20260217062128_init_db` | Unique index on `Trip.busId`. |
+| `20260217124914_init_db` | Collapses the profile tables into `User`; drops `Attendance`, `BusLocation`, `BusRoute`, `Driver`, `FuelRecord`, `StopTime`, `Student`, `TripStop`. |
+| `20261008154716_bus_db` | Adds new `NotificationType` values; makes `Notification` role-targeted (`userRole` + `link`, drops `userId`/`stopId`); widens `Booking.seatNumber` to `TEXT`; drops the `Trip` unique indexes. |
+| `20261009120000_rename_student_to_passenger` | `STUDENT` → `PASSENGER` enum value; `studentId` → `passengerId` columns/indexes/FKs. |
 
 ---
 
-## Redis, BullMQ & Rate Limiting
+## API reference
 
-Three optional, independent capabilities. **All three work without Redis** — the
-app degrades to per-process memory and inline execution, so nothing breaks if
-`REDIS_URL` is unset. This is deliberate: the target deployment is Vercel
-Hobby, which cannot host a long-lived worker process.
+Base URL: same origin, path prefix `/api`. All endpoints (except `auth/login`,
+`auth/register` and `health/live`) require:
 
-| Concern | Redis present | Redis absent |
-| --- | --- | --- |
-| **Cache** (`src/lib/cache.js`) | Shared across instances, invalidated via version keys | Bounded in-process `Map` (500 entries) |
-| **Rate limiting** (`src/lib/rateLimiter.js`) | Distributed counters, shared across instances | Per-process counters |
-| **Jobs** (`src/lib/queue.js`) | Published to BullMQ; consumed by `worker/index.mjs` | Executed inline inside the request |
-
-### 1. Caching (`src/lib/cache.js`)
-
-Cache-aside reads for the heavy, read-mostly collections. Every entry lives at
-`bus:cache:<namespace>:<version>:<suffix>`.
-
-Invalidation uses a **per-namespace version counter**, not a key sweep: flushing
-a namespace is one atomic `INCR` on `bus:cachever:<namespace>`. Stale entries
-become unreachable instantly and expire on their own TTL, so there is never a
-`KEYS`/`SCAN` (which blocks Redis) and never an O(n) delete.
-
-```js
-import { withCache, CACHE_NAMESPACES, cacheHeaders, searchParamsKey } from '@/lib/cache';
-
-const result = await withCache(CACHE_NAMESPACES.BUSES, searchParamsKey(req), async () => {
-  return { buses: await prisma.bus.findMany() };
-});
-
-return NextResponse.json(result.data, { headers: cacheHeaders(result) });
-// -> X-Cache: HIT | MISS, X-Cache-Source: redis | memory
+```
+Authorization: Bearer <jwt>
+Content-Type: application/json
 ```
 
-Namespaces and TTLs:
+Routes export `runtime = 'nodejs'` and `dynamic = 'force-dynamic'`, so every
+response is computed per request and never statically cached by Next.js.
 
-| Namespace | TTL | Cached by |
+### Standard response shapes
+
+| Situation | Status | Body |
 | --- | --- | --- |
-| `routes`, `stops`, `reports`, `maintenance` | 60s | query string |
-| `buses`, `schedules`, `dashboard`, `assignments` | 30s | query string / `admin` |
-| `trips` | 15s | query string |
-| `notifications` | 10s | **`<role>:<query>`** |
+| Success (read) | `200` | resource payload (often wrapped, e.g. `{ buses: [...] }`) |
+| Created | `201` | `{ message, <resource> }` |
+| Validation error | `400` | `{ error: "…" }` |
+| Missing/invalid token | `401` | `{ error: "No token provided" }` / `{ error: "Invalid or expired token" }` |
+| Wrong role | `403` | `{ error: "Access denied. Insufficient permissions." }` |
+| Deactivated account | `403` | `{ error: "Account is deactivated" }` |
+| Not found | `404` | `{ error: "… not found" }` |
+| Duplicate/conflict | `400` / `409` | `{ error: "…" }` |
+| Rate limited | `429` | `{ error, code: "RATE_LIMITED", retryAfter, limit }` |
+| Server error | `500` | `{ error: "Failed to …" }` |
 
-> `notifications` **must** include the role in the key — the feed is
-> role-scoped, so omitting it would leak an admin's notifications to a
-> passenger. `trips`/`notifications` use short TTLs because the UI polls them.
+Rate-limited responses also carry `RateLimit-Limit`, `RateLimit-Remaining`,
+`RateLimit-Reset`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
+`X-RateLimit-Policy` and (when blocked) `Retry-After`.
+Cached reads carry `X-Cache: HIT|MISS` and, on a hit, `X-Cache-Source`.
 
-Every mutating handler calls `invalidate(...)` for the namespaces it affects
-(e.g. creating a schedule flushes `SCHEDULES`, `BUSES`, `DASHBOARD`).
+### Auth — `/api/auth`
 
-### 2. BullMQ message broker (`src/lib/queue.js` + `worker/index.mjs`)
-
-Two queues:
-
-| Queue | Jobs | Notes |
-| --- | --- | --- |
-| `notifications` | `notification.create`, `notification.broadcast`, `notification.emergency` | 5 attempts, exponential backoff |
-| `audit` | `audit.log` | 10-way concurrency |
-
-Route handlers call the `src/lib/enqueue.js` facade rather than touching queues:
-
-```js
-await enqueueNotification({ userRole: 'PASSENGER', type: 'ROUTE_CREATED', title, message, link });
-await enqueueBroadcast({ roles: ['ADMIN','DRIVER','PASSENGER'], type, title, message });
-await enqueueEmergencyBroadcast({ message, userId });
-```
-
-These never reject: a failed enqueue falls back to inline execution, because a
-notification is a side effect that must not fail the user's booking.
-
-**Start the worker** (required only when `REDIS_URL` is set):
-
-```bash
-npm run worker
-```
-
-Job handlers live in `src/lib/jobs/*.jobs.mjs` as plain ESM with **no imports** —
-Prisma is injected as `{ prisma }`. That lets the *same file* load in both the
-Next.js bundle (where `@/lib/prisma` resolves) and the standalone worker (plain
-Node, no bundler, no path aliases).
-
-> ⚠️ If `REDIS_URL` is set but no worker is running, jobs queue up and are never
-> written. `GET /api/health` reports `queue.deliveryMode` and
-> `queue.pendingJobs` so this misconfiguration is visible.
-
-### 3. Manual rate limiting
-
-No third-party limiter library — two algorithms are implemented directly with
-Redis Lua scripts, each mirrored by an in-process fallback.
-
-| Algorithm | Redis implementation | Trade-off |
-| --- | --- | --- |
-| `fixed` (default) | `INCR` + `PEXPIRE` in one Lua script | One round trip; a burst at a window boundary can reach 2x |
-| `sliding` | Sorted set trimmed by score, in one Lua script | Exact; stores one member per request |
-
-Lua is used rather than `MULTI`/`EXEC` because check-and-increment must be
-atomic — reading the counter in Node and writing it back is a TOCTOU race that
-lets concurrent requests overshoot the limit.
-
-**Identity** (`getRateLimitIdentity`): authenticated callers are keyed by user
-id, anonymous callers by IP (left-most `x-forwarded-for` hop). Keying logged-in
-users by id prevents one noisy user from exhausting the allowance of everyone
-behind the same campus NAT.
-
-**Policies** (`RATE_LIMITS`):
-
-| Policy | Limit | Window | Algorithm | Applied to |
+| Method | Path | Roles | Body / query | Notes |
 | --- | --- | --- | --- | --- |
-| `LOGIN` | 10 | 60s | sliding | per IP **and** per email |
-| `REGISTER` | 5 | 60s | sliding | per IP **and** per email |
-| `QR_VERIFY` | 60 | 60s | sliding | bus pass verification |
-| `BROADCAST` | 5 | 60s | fixed | emergency broadcast |
-| `REPORTS` | 30 | 60s | fixed | `/api/reports` |
-| `BOOKING_WRITE` | 20 | 60s | fixed | booking creation |
-| `BULK_WRITE` | 15 | 60s | fixed | bus passes |
-| `COLLECTION_WRITE` | 40 | 60s | fixed | generic CRUD writes |
-| `DASHBOARD` / `ACTIVITY_LOGS` | 60 | 60s | fixed | dashboard, audit trail |
-| `COLLECTION_READ` | 120 | 60s | fixed | generic CRUD reads |
-| `DEFAULT` | 100 | 60s | fixed | anything unlisted |
+| `POST` | `/api/auth/login` | public | `{ email, password }` | Sliding-window `LOGIN` limit applied **per IP and per email**. Returns `{ message, token, user }` (password stripped). Writes a `LOGIN` audit entry. |
+| `POST` | `/api/auth/register` | public | `{ email, password, name, phone?, role?, passengerId?, licenseNumber? }` | `role` defaults to `PASSENGER`; only `PASSENGER`/`DRIVER` accepted (`PUBLIC_REGISTER_ROLES`). Password ≥ 6 chars. `passengerId` required for passengers, `licenseNumber` for drivers. Returns `{ message, token, user }`. |
+| `GET` | `/api/auth/me` | all | — | Re-validates the stored token and returns the fresh user. Used on app bootstrap to detect expired tokens and deactivated accounts. |
 
-Applying a limit in a handler:
+### Users — `/api/users`
 
-```js
-const limited = await enforceRateLimit(req, 'COLLECTION_READ', { user });
-if (limited) return limited;   // ready-made 429, or null when allowed
-```
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/users` | `ADMIN` | Query: `role`, `isActive`. Password never selected. |
+| `POST` | `/api/users` | `ADMIN` | Body: `{ email, password, name, phone?, role?, passengerId?, licenseNumber? }`. Role defaults to `PASSENGER`; bcrypt cost 12. |
+| `GET` | `/api/users/:id` | all | |
+| `PUT` | `/api/users/:id` | all | A non-admin may only update **their own** profile (`403` otherwise). Updatable: `name`, `phone`, `password`, `passengerId`, `licenseNumber`. |
+| `DELETE` | `/api/users/:id` | `ADMIN` | **Soft delete** — sets `isActive: false`, writes `DEACTIVATE_USER`. |
 
-Rejections return `429` with `Retry-After`, `RateLimit-*` and `X-RateLimit-*`
-headers plus a JSON body `{ error, code: 'RATE_LIMITED', retryAfter, limit }`.
+### Buses — `/api/buses`
 
-**Failure policy is fail-open.** Rate limiting is a protection layer, not an
-authorization check — refusing all traffic because Redis blipped would turn a
-cache outage into a full outage. On Redis trouble the limiter degrades to
-in-process counters. A circuit breaker (`src/lib/redis.js`) skips Redis entirely
-for 30s after 3 consecutive failures so an outage never costs a connection
-timeout per request.
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/buses` | all | Cached (`buses`, TTL 30 s). Query: `status`, `search`. |
+| `POST` | `/api/buses` | `ADMIN` | Body: `{ busNumber, plateNumber, capacity, model?, year?, fuelType?, mileage? }`. |
+| `GET` | `/api/buses/:id` | all | Cached by `id:<id>`; includes driver, schedules, maintenance. |
+| `PUT` | `/api/buses/:id` | `ADMIN` | Partial update; invalidates `BUSES`, `DASHBOARD`. |
+| `DELETE` | `/api/buses/:id` | `ADMIN` | |
 
-### 4. Frontend rate limiting
+### Routes & stops — `/api/routes`, `/api/stops`
 
-The server is always authoritative; the client layer exists to avoid *making* a
-doomed request. Two mechanisms, deliberately layered:
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/routes` | all | Cached; includes stops ordered by `order`. |
+| `POST` | `/api/routes` | `ADMIN` | Body: `{ name, description?, estimatedDuration, distance, stops? }`. Notifies passengers (`ROUTE_CREATED`). |
+| `GET` `PUT` `DELETE` | `/api/routes/:id` | `GET` all, writes `ADMIN` | |
+| `GET` | `/api/stops` | all | Query: `routeId`. Cached. |
+| `POST` | `/api/stops` | `ADMIN` | Body: `{ name, latitude, longitude, address?, order?, routeId }`. Lat/lng must parse as finite numbers; route must exist. Notifies passengers (`STOP_CREATED`). |
+| `GET` `PUT` `DELETE` | `/api/stops/:id` | `GET` all, writes `ADMIN` | Mutations invalidate `STOPS` **and** `ROUTES` (route detail embeds stops). |
 
-1. **Local buckets** (`src/utils/clientRateLimit.js`) — a manual
-   sliding-window counter in `sessionStorage`, mirroring the server policies
-   (slightly tighter, so the client defers first). Stops double-clicks,
-   Enter-key spam and tight polling loops.
-2. **Server-signalled cooldown** (`applyServerRateLimit`) — when the API does
-   answer `429`, `Retry-After` is trusted and a hard cooldown is installed.
-   This is what actually keeps client and server in agreement, since the local
-   bucket cannot know about other tabs, devices, or clients behind the same IP.
+### Schedules — `/api/schedules`
 
-`services/client.js` wires both in: the request interceptor short-circuits
-known-limited actions, the response interceptor folds `429`s back into the
-cooldown.
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/schedules` | all | Query: `routeId`, `busId`, `scheduleType`, `isActive`, `isSpecial`. Ordered by `departureTime`. |
+| `POST` | `/api/schedules` | `ADMIN` | Body: `{ routeId, busId, scheduleType, departureTime, arrivalTime, daysOfWeek[], isSpecial?, specialDate?, notes?, stopTimes? }`. Verifies route **and** bus exist. Notifies passengers (`SCHEDULE_CHANGE`). |
+| `GET` `PUT` `DELETE` | `/api/schedules/:id` | `GET` all, writes `ADMIN` | Mutations invalidate `SCHEDULES`, `BUSES`, `DASHBOARD`. |
 
-For live countdown UI use the hook:
+### Trips — `/api/trips`
 
-```jsx
-import { useRateLimit } from '@/hooks/useRateLimit';
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/trips` | all | Cached (TTL **15 s**). Query: `routeId`, `busId`, `date`. |
+| `POST` | `/api/trips` | `ADMIN`, `DRIVER` | Body: `{ scheduleId }`. Derives route/bus from the schedule, uses now as `startTime`, adds the schedule's duration for `endTime`, sets `status: "SCHEDULED"`, assigns the caller as driver when they are an active `DRIVER`. Notifies `TRIP_SCHEDULED`. |
+| `GET` | `/api/trips/:id` | all | |
+| `PUT` | `/api/trips/:id` | `ADMIN`, `DRIVER` | Body: `{ status }`. A driver may only change **their own** trip (`403` otherwise). Valid statuses: `SCHEDULED`, `IN_PROGRESS`, `COMPLETED`, `CANCELLED`. `COMPLETED`/`CANCELLED` are **terminal** — further changes are rejected with `400`. `IN_PROGRESS` stamps `actualStartTime`; `COMPLETED` stamps `endTime` + `actualEndTime`. |
+| `DELETE` | `/api/trips/:id` | `ADMIN` | |
 
-const limiter = useRateLimit('login');
+### Bookings — `/api/bookings`
 
-const onSubmit = async (e) => {
-  e.preventDefault();
-  const verdict = limiter.guard();          // consumes a local token
-  if (!verdict.allowed) return setError(verdict.message);
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/bookings` | all | Admins see all; passengers/drivers see their own. Query: `tripId`, `status`, date. |
+| `POST` | `/api/bookings` | `ADMIN`, `PASSENGER` | Body: `{ tripId, stopId, bookingDate }`. Uses the stricter `BOOKING_WRITE` policy. `bookingDate` is parsed as **local** midnight. Rejects a stop that does not belong to the trip's route (`400`) and a duplicate active booking for the same trip/day (`409`). Seat allocation + insert run in a **`Serializable`** transaction; a full bus raises `NO_SEATS` → `400 "No seats available for this trip"`. Seat labels are generated as `1A…1D, 2A…`. Generates a QR data URL and notifies drivers (`BOOKING_CONFIRMATION`). |
+| `GET` | `/api/bookings/:id` | all | |
+| `PUT` | `/api/bookings/:id` | `ADMIN`, `PASSENGER` | A passenger may only modify **their own** booking and may only set `status: "CANCELLED"` (`403` otherwise). Invalidates `REPORTS` + `DASHBOARD`. |
+| `DELETE` | `/api/bookings/:id` | `ADMIN` | |
 
-  try {
-    await login(email, password);
-    limiter.reset();                        // clear on success
-  } catch (err) {
-    if (limiter.handleError(err)) return;   // installs cooldown from Retry-After
-    throw err;
-  }
-};
+### Bus passes — `/api/buspass`
 
-// <Button disabled={limiter.isLimited}>
-//   {limiter.isLimited ? `Try again in ${limiter.waitLabel}` : 'Sign In'}
-// </Button>
-```
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/buspass` | `ADMIN`, `PASSENGER` | Passengers are scoped to their own pass; admins may filter with `passengerId`. |
+| `POST` | `/api/buspass` | `ADMIN` | Body: `{ passengerId, startDate, endDate }`. Target must exist and be a `PASSENGER`; `endDate` must be after `startDate`; an already-active, non-expired pass is a `400`. Generates `BP-<timestamp>-<random>` and a QR data URL. Notifies the passenger (`BUS_PASS_CREATED`). Uses the `BULK_WRITE` policy. |
+| `PUT` | `/api/buspass` | `ADMIN`, `DRIVER` | **QR verification / boarding.** Body: `{ qrCode \| passNumber }`. Uses the sliding `QR_VERIFY` policy. Looks up an active, non-expired pass, then marks today's `CONFIRMED`/`COMPLETED` bookings for that passenger as `isUsed: true` (attendance). The day window is `gte: startOfDay(), lt: startOfNextDay()` — deliberately matching the reports read path. Writes `VERIFY_BUS_PASS` and invalidates `REPORTS` + `DASHBOARD`. Returns `{ valid: true, busPass: {...}, attendance: { marked } }`. |
+| `PATCH` | `/api/buspass` | `ADMIN` | Body: `{ id, startDate?, endDate?, isActive? }`. |
+| `DELETE` | `/api/buspass?id=<id>` | `ADMIN` | |
 
-The hook ticks once per second **only while blocked**, so idle pages run no
-timers. Implemented in the login and register pages; `CLIENT_LIMITS` covers
-`login`, `register`, `booking-create`, `feedback-submit`, `notification-send`,
-`broadcast`, `qr-verify`, `api-read`, `api-write`.
+### Maintenance — `/api/maintenance`
 
-### 5. Observability
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/maintenance` | `ADMIN` | Query: `busId`, `status`, `type`. |
+| `POST` | `/api/maintenance` | `ADMIN` | Body: `{ busId, type, description, scheduledDate, cost?, notes? }`. A `REPAIR`/`BREAKDOWN` flips the bus to `MAINTENANCE`. Notifies drivers (`MAINTENANCE_CREATED`). |
+| `PUT` | `/api/maintenance` | `ADMIN` | Body: `{ id, status, cost?, notes? }`. `COMPLETED` stamps `completedDate` and returns the bus to `ACTIVE` with a fresh `lastMaintenance`. |
+| `DELETE` | `/api/maintenance` | `ADMIN` | |
 
-`GET /api/health` (admin only) reports Redis status, cache entry counts and
-namespace versions, active policies, and queue depth:
+### Assignments — `/api/assignments`
 
-```json
-{
-  "status": "ok",
-  "redis": { "configured": true, "status": "ready", "usable": true, "circuitOpenUntil": null },
-  "cache": { "entries": 12, "versions": { "buses": 3 } },
-  "rateLimiter": { "policies": ["LOGIN", "..."], "buckets": 4, "redisBacked": true },
-  "queue": { "configured": true, "deliveryMode": "brokered", "pendingJobs": 0, "workerRequired": true },
-  "audit": { "mode": "brokered" }
-}
-```
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/assignments` | `ADMIN` | Returns `{ buses, availableDrivers, stats: { totalBuses, assignedBuses, unassignedBuses, availableDrivers } }`. Query: `status`, `search` (bus number, plate, driver name). Cached (30 s). |
+| `POST` | `/api/assignments` | `ADMIN` | Body: `{ busId, driverId }`. Rejects an already-assigned bus, an already-assigned driver, a non-driver, and a deactivated driver. Notifies the driver ("Bus Assignment"). |
+| `DELETE` | `/api/assignments?busId=<id>` | `ADMIN` | Unassigns the driver from that bus. |
 
-### Running Redis locally
+### Notifications — `/api/notifications`
 
-```bash
-docker run -d --name bus-redis -p 6379:6379 redis:7-alpine
-# then, in two terminals:
-npm run dev
-npm run worker
-```
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/notifications` | all | Admins see everything; other roles see only their own `userRole` rows. Query: `isRead`, `type`. Returns `{ notifications, unreadCount }`, newest first, max 50. **The role is part of the cache key** (TTL 10 s) so one role can never be served another role's feed. |
+| `POST` | `/api/notifications` | `ADMIN` | Body: `{ type, title, message, userRole?, link? }`. With `userRole` → one role-targeted row; without → a broadcast fanning out to all three roles in a single transaction. `type` must be one of the twelve `NotificationType` values. |
+| `PUT` | `/api/notifications` | all | Body: `{ notificationIds?, markAllRead?, deleteNotificationIds? }`. |
+| `DELETE` | `/api/notifications?id=<id>` | `ADMIN` | With `id` deletes one row; without, deletes all read notifications (cleanup). |
 
-To run entirely without Redis, leave `REDIS_URL` empty — the app is fully
-functional, just without shared caching, distributed limits or the queue.
+### Dashboard — `/api/dashboard`
+
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/dashboard` | `ADMIN` | ~13 aggregates executed with `Promise.all`, cached for 30 s under `dashboard:admin`. Returns `{ stats, recentTrips, upcomingSchedules, maintenanceAlerts }`. |
+| `POST` | `/api/dashboard` | `ADMIN` | **Emergency broadcast.** Body: `{ message, routeId? }`. Uses the tightest policy (`BROADCAST`: 5/min). Fans out to every role and writes an `EMERGENCY_BROADCAST` audit row in the same job. Invalidates `NOTIFICATIONS` + `DASHBOARD`. |
+
+### Feedback — `/api/feedback`
+
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/feedback` | all | Admins see all feedback; others see only their own. Query: `tripId`. Includes author and trip/route summary. |
+| `POST` | `/api/feedback` | `ADMIN`, `PASSENGER` | Body: `{ tripId?, rating, comment? }`. `rating` must be 1–5. Notifies admins (`FEEDBACK_RECEIVED`). |
 
 ---
+
+
+### Reports — `/api/reports`
+
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/reports` | `ADMIN` | Uses the tightest read policy (`REPORTS`: 30/min). Cached per query string (60 s). |
+
+`type` selects the report; anything unrecognised returns the overview.
+
+| `type` | Query params | Returns |
+| --- | --- | --- |
+| `daily-summary` | — | `date` (local key), trip counts (total/completed/cancelled), `trips[]`, and `stats: { total, present, absent, attendanceRate }`. Attendance is derived from bookings dated **today** with status `CONFIRMED`/`COMPLETED`; `isUsed` marks present. `attendanceRate` is guarded against 0/0 (returns `0`, not `NaN`) and rounded to one decimal. |
+| `bus-usage` | `startDate?`, `endDate?`, `busId?` | Per-bus `totalTrips` and `totalBookings` via `_count`. |
+| `driver-performance` | `startDate?`, `endDate?`, `driverId?` | Per-driver trip counts and availability. |
+| `fuel-consumption` | `startDate?`, `endDate?`, `busId?` | Estimated fuel units (`mileage ÷ km-per-unit`) and maintenance cost totals. Ratios: `DIESEL 3.5`, `PETROL 4.0`, `CNG 4.5`, `ELECTRIC 5.5`. |
+| *(default)* | — | `overview: { totalUsers, totalBuses, totalRoutes, totalTrips, activeBuses }`. |
+
+### Activity logs — `/api/activity-logs`
+
+| Method | Path | Roles | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/activity-logs` | `ADMIN` | Query: `userId`, `action`, `startDate`, `endDate`, `page` (default 1), `limit` (default 20, clamped to 1–100). Uses the dedicated `ACTIVITY_LOGS` policy because the table grows unbounded. |
+
+### Health
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/health` | `ADMIN` | Reports `{ status, timestamp, redis, cache, rateLimiter, queue, audit }`. The key field is `queue.deliveryMode`: `brokered` (Redis configured, worker required) or `inline` (no Redis, jobs run in-request). `queue.pendingJobs` climbing while `brokered` means the API is publishing but nothing is consuming. |
+| `GET` | `/api/health/live` | **public** | Liveness probe. No DB, Redis, auth or rate limiting — it only answers "is the HTTP server up?". Deliberately separate from `/api/health`, which is admin-only and would make every container probe fail with `401`. Sends `Cache-Control: no-store`. |
+
+---
+
+
+## Infrastructure layers
+
+All three layers below are **optional-additive**: they work with Redis and
+without it, and the fallback is behaviourally equivalent (minus cross-instance
+sharing).
+
+### Redis client — `src/lib/redis.js`
+
+Two deliberately different connection shapes:
+
+| Helper | Role | Options |
+| --- | --- | --- |
+| `getRedis()` | app client (cache + rate limiting) | `maxRetriesPerRequest: 1`, `commandTimeout: 2000` — **fails fast** so a Redis outage can never hang an API request. |
+| `createQueueConnection()` | BullMQ producers/workers | `maxRetriesPerRequest: null` — BullMQ requires this so blocking commands are not aborted mid-wait. |
+
+A **circuit breaker** (3 consecutive failures → 30 s cooldown) skips Redis
+entirely during an outage instead of paying a connection timeout on every call.
+Importing the module opens **no** connection — clients are constructed lazily, so
+a process without `REDIS_URL` never touches the network. `resetRedisState()`,
+`isRedisUsable()`, `recordRedisSuccess()` and `recordRedisFailure()` are exported
+for callers and tooling.
+
+### Response cache — `src/lib/cache.js`
+
+Cache-aside with **version-counter invalidation** rather than key scanning:
+
+```
+bus:cache:<namespace>:<version>:<suffix>
+bus:cachever:<namespace>          <- INCR to flush
+```
+
+Flushing a namespace is a single atomic `INCR`; stale entries become unreachable
+instantly and expire on their own TTL. There is never a `KEYS`/`SCAN` sweep
+(which would block Redis) and never an O(n) delete.
+
+| Namespace | TTL (s) | Notes |
+| --- | --- | --- |
+| `routes` | 60 | |
+| `stops` | 60 | |
+| `buses` | 30 | |
+| `schedules` | 30 | |
+| `trips` | 15 | Polled by drivers, changes intraday |
+| `dashboard` | 30 | ~13 aggregates, admin-only and shared |
+| `reports` | 60 | Heaviest reads |
+| `notifications` | 10 | Polled by the navbar; role-scoped key |
+| `maintenance` | 60 | |
+| `assignments` | 30 | |
+
+Exports: `withCache`, `invalidate(...namespaces)`, `cacheHeaders(result)`,
+`searchParamsKey(req)` (sorted, so `?a=1&b=2` and `?b=2&a=1` share an entry),
+`cacheStatus()`, `clearCache()`. The in-memory fallback is bounded by
+`CACHE_MEMORY_MAX_ENTRIES` (FIFO eviction).
+
+> **Correctness rule for new endpoints:** whenever a write changes data that a
+> cached read exposes, invalidate *every* affected namespace — including
+> `DASHBOARD` and `REPORTS`, which aggregate across collections.
+
+---
+
+
+### Rate limiter — `src/lib/rateLimiter.js`
+
+Hand-rolled (no third-party limiter), with two algorithms, both implemented as
+atomic Redis **Lua** scripts and mirrored by an in-process fallback:
+
+- **`fixed`** — `INCR` + `PEXPIRE` in one script. One round trip, one counter per
+  window. Cheapest; a burst at a window boundary can allow up to 2x the limit.
+- **`sliding`** — a sorted-set log trimmed by score. Exact "N per window" with no
+  boundary burst, at the cost of one member per request. Used for abuse-sensitive
+  endpoints.
+
+Lua is used instead of `MULTI/EXEC` because check-and-increment must be a single
+atomic step — reading in Node and writing back would be a TOCTOU race that lets
+concurrent requests overshoot the limit.
+
+| Policy | Max / window | Algorithm | Applied to |
+| --- | --- | --- | --- |
+| `LOGIN` | 10 / 60 s | sliding | `/api/auth/login` (per IP **and** per email) |
+| `REGISTER` | 5 / 60 s | sliding | `/api/auth/register` (per IP **and** per email) |
+| `REPORTS` | 30 / 60 s | fixed | `/api/reports` |
+| `DASHBOARD` | 60 / 60 s | fixed | `/api/dashboard` GET |
+| `ACTIVITY_LOGS` | 60 / 60 s | fixed | `/api/activity-logs` |
+| `COLLECTION_READ` | 120 / 60 s | fixed | list/detail reads |
+| `COLLECTION_WRITE` | 40 / 60 s | fixed | generic mutations |
+| `BOOKING_WRITE` | 20 / 60 s | fixed | `/api/bookings` POST |
+| `BULK_WRITE` | 15 / 60 s | fixed | bus-pass issue/delete |
+| `QR_VERIFY` | 60 / 60 s | sliding | `/api/buspass` PUT (boarding) |
+| `BROADCAST` | 5 / 60 s | fixed | emergency broadcast |
+| `DEFAULT` | 100 / 60 s | fixed | anything else |
+
+Identity is `user:<id>` when authenticated (falling back to `ip:<addr>`), with an
+optional `:<extra>` discriminator. The failure policy is deliberately
+**fail-open**: rate limiting is a protection layer, not an authorization check,
+so a Redis blip must not become a full outage.
+
+### Client-side mirroring
+
+`src/utils/clientRateLimit.js` + `src/hooks/useRateLimit.js` layer two mechanisms
+so the UI defers *before* making a doomed request:
+
+1. **Local token buckets** (`CLIENT_LIMITS`) mirror the server policies but are
+   kept *tighter*, protecting against double-clicks and Enter-key spam.
+2. **Server-signalled cooldown** — on a `429` the `Retry-After` header is trusted
+   and a hard cooldown is installed for that action. This is what actually keeps
+   client and server in agreement, since a local bucket cannot know about other
+   tabs or devices.
+
+State lives in `sessionStorage`, so a refresh does not clear a cooldown but a new
+tab starts clean. `useRateLimit(action)` exposes `isLimited`, `waitLabel`,
+`guard()`, `handleError()`, `reset()` and a `1 s` countdown that only ticks while
+blocked. The axios instance in `src/services/client.js` consumes tokens
+automatically and skips the local bucket for plain reads (`api-read`) so
+background polling is never blocked client-side.
+
+### Job queue — `src/lib/queue.js`, `src/lib/enqueue.js`, `worker/index.mjs`
+
+| Queue | Jobs | Concurrency |
+| --- | --- | --- |
+| `notifications` | `notification.create`, `notification.broadcast`, `notification.emergency` | 5 |
+| `audit` | `audit.log` | 10 |
+
+Default job options: `attempts: 5`, exponential backoff starting at `2 s`,
+`removeOnComplete: { age: 3600, count: 1000 }`, `removeOnFail: { age: 86400 }`.
+
+- **Producers never throw.** A failed enqueue logs and falls back to running the
+  same handler inline, so a notification side effect can never fail a booking.
+- **Enqueue timeout** (`QUEUE_ENQUEUE_TIMEOUT_MS`, default 2 s) exists because
+  BullMQ requires `maxRetriesPerRequest: null`; without the timeout a *reachable
+  but unresponsive* Redis would hang every mutating request forever.
+- **Circuit-breaker aware.** When the breaker is open the broker is skipped
+  entirely, so writes do not each pay the enqueue timeout before falling back.
+- **Audit logging is fire-and-forget** (`logActivity`): it never throws, so an
+  audit failure cannot break the primary operation. With Redis configured but no
+  worker running, audit rows queue up instead of being written — `/api/health`
+  exposes that depth.
+- **`enqueueEmergencyBroadcast`** fans out to all roles *and* writes the audit row
+  in the same job, so a broadcast can never exist without its audit record. The
+  audit write is skipped when `userId` is null (the `ActivityLog.userId` FK would
+  otherwise fail).
+
+The worker also handles `SIGINT`/`SIGTERM` with a graceful drain (workers → queue
+events → Prisma) and reports `unhandledRejection`. It exits `0` with an
+explanatory message when `REDIS_URL` is unset, since the API is already in inline
+mode.
+
+### Date helpers — `src/utils/dates.js`
+
+Local-day helpers exist because two easy mistakes silently corrupt attendance:
+
+1. `new Date('2026-02-16')` is parsed as **UTC** midnight, while
+   `setHours(0,0,0,0)` operates in **local** time — mixing them shifts a day
+   window by one day for any negative-offset timezone.
+2. `date.toISOString().split('T')[0]` yields the **UTC** calendar date, which is
+   the *previous* day for local times earlier than the UTC offset.
+
+`startOfDay`, `endOfDay`, `startOfNextDay`, `dayRange`, `parseDateOnly` and
+`toLocalDateKey` all work in local time, so "today" means the same instant to the
+database query, the write path and the rendered label. Use `startOfNextDay()` as
+the **exclusive** upper bound (`lt`) — `lte: endOfDay` silently drops anything in
+the final millisecond.
+
+---
+
+## Security model
+
+### Authentication
+
+- JWT signed with `JWT_SECRET`, lifetime `JWT_EXPIRES_IN` (default `7d`). Payload:
+  `{ userId, email, role }`.
+- The secret is resolved **lazily** at call time, not module load, so `next build`
+  can import the module for static analysis while a misconfigured production
+  deployment still fails fast on the first request rather than issuing tokens
+  signed with a development fallback.
+- In `NODE_ENV=production` a missing `JWT_SECRET` **throws**; the
+  `'your-super-secret-jwt-key-change-in-production'` fallback is used only in
+  development/test.
+- The token is never trusted alone: `authMiddleware` re-loads the user from the
+  database on **every** request and rejects deleted users (`401`) and
+  `isActive: false` accounts (`403`). This makes deactivation effective
+  immediately instead of when the token expires.
+
+### Authorization
+
+- Role checks are declared per handler via `authMiddleware(req, [...roles])`.
+- Ownership is enforced *in addition to* role checks on the resources where it
+  matters: passengers may only read/modify their own bookings, feedback, and bus
+  pass; drivers may only change trips they are assigned to; non-admins may only
+  edit their own user profile.
+- `PUBLIC_REGISTER_ROLES = ['PASSENGER', 'DRIVER']` — public self-registration can
+  never mint an `ADMIN`.
+- Passwords are hashed with bcrypt cost **12** and are never returned: `/api/auth/*`
+  strips the field, `/api/users` uses an explicit `select`.
+
+### Rate limiting
+
+See [Rate limiter](#rate-limiter--srclibratelimiterjs). Credential endpoints are
+keyed by **IP and email** so one noisy actor cannot exhaust the allowance of
+everyone behind a campus NAT, and so credential stuffing against many accounts
+from one IP is still capped.
+
+### Transport and headers
+
+- QR verification requires a **secure context** (HTTPS or `localhost`) because
+  camera access does. `QRVerifier` detects the absence of `navigator.mediaDevices`
+  and shows an actionable message instead of failing silently.
+- `X-Forwarded-For` / `X-Real-IP` are used for client identification; deploy
+  behind a proxy that sets them.
+- `/api/health/live` sets `Cache-Control: no-store` so a probe result is never
+  cached by an intermediary.
+
+### Known limitations
+
+- **JWTs cannot be revoked before expiry.** Deactivation works because the user is
+  re-read per request, but a role change only takes effect on the next request —
+  which is intentional and correct here. There is no refresh-token flow, so the
+  client simply re-authenticates when a `401` arrives (the axios interceptor
+  clears storage and redirects to `/login`).
+- **`next.config.mjs` disables the client Router Cache** (`staleTimes: { dynamic: 0,
+  static: 0 }`) so dashboard tabs always fetch fresh data. The trade-off is more
+  requests; server-side caching absorbs it.
+- **`/api/trips` GET has a 15 s TTL**; a driver who starts a trip may briefly see
+  a stale list from another client. Writes invalidate `TRIPS`, `DASHBOARD` and
+  `REPORTS` immediately for the instance that performed the write.
+
 
 ## Testing
 
-Vitest, chosen over Jest because the queue layer and the worker are native ESM
-(`.mjs`); Vitest runs ESM natively, so those files are imported directly with no
-transform shims.
-
 ```bash
-npm test              # run everything once
-npm run test:watch    # watch mode
-npm run test:unit     # tests/unit only
-npm run test:e2e      # tests/e2e only
-npm run test:coverage # v8 coverage -> ./coverage
+npm test               # everything
+npm run test:unit      # tests/unit/**
+npm run test:e2e       # tests/e2e/**
+npm run test:coverage  # + HTML/lcov report in ./coverage
 ```
 
-**No infrastructure is required.** There is no Redis server, no database and no
-network access: the suites deliberately run against the documented degraded
-paths, and a test can opt into the Redis-backed paths via an in-memory double.
+The suite runs with **no database and no Redis**. It is designed so that
+importing an application module cannot fail or reach a real service.
 
-### Layout
+### Configuration — `vitest.config.mjs`
 
-```
-tests/
-├── setup.js                    # env defaults + per-test state isolation
-├── helpers/
-│   ├── fakeRedis.js            # in-memory Redis double (implements both Lua scripts)
-│   └── prismaMock.js           # Prisma double + user fixtures
-├── unit/
-│   ├── cache.test.js           # hit/miss, TTL, version-key invalidation
-│   ├── rateLimiter.test.js     # both algorithms, headers, fail-open
-│   ├── redis.test.js           # circuit breaker, Lua paths, Redis fallbacks
-│   ├── queue.test.js           # inline fallback (no Redis)
-│   ├── queueRedis.test.js      # enqueue timeout, queued mode, breaker pre-check
-│   ├── enqueue.test.js         # facade wiring end-to-end
-│   ├── jobs.test.js            # job handlers against an injected Prisma stub
-│   ├── dates.test.js           # local-day helpers + attendance arithmetic
-│   ├── prismaMockCoverage.test.js # the Prisma double covers every route usage
-│   └── clientRateLimit.test.js # browser limiter + cooldown (jsdom)
-└── e2e/
-    ├── auth.login.test.js      # real login handler: auth, per-IP + per-email 429
-    ├── cacheRoutes.test.js     # X-Cache MISS->HIT, invalidation, role isolation
-    ├── attendance.test.js      # attendance read/write path agreement
-    ├── health.test.js          # /api/health reporting (admin-only)
-    └── healthLive.test.js      # /api/health/live liveness probe
-```
+| Setting | Value | Why |
+| --- | --- | --- |
+| `environment` | `node` | Almost everything under test is server-side. Browser-dependent suites opt in per file with `// @vitest-environment jsdom`. |
+| `globals` | `true` | `describe`/`it`/`expect` available without imports. |
+| `include` | `tests/**/*.test.{js,mjs}` | |
+| `setupFiles` | `./tests/setup.js` | |
+| `isolate` | `true` | A fresh module registry per file, so the `globalThis` singletons used by redis/cache/rate-limiter (which exist to survive hot reloads) cannot leak state. |
+| `coverage.include` | `src/lib/**`, `src/utils/**`, `src/hooks/**`, `worker/**` | `src/lib/jobs/**/*.mjs` is excluded (thin DB shims). |
 
-### Unit vs end-to-end
+Vitest was chosen over Jest because the queue layer and the BullMQ worker are
+native ESM `.mjs`; Vitest runs ESM natively, so those modules are importable
+without transform shims. `restoreMocks` is deliberately **not** enabled — it
+would wipe the default `async () => null` behaviour of the Prisma doubles.
+Isolation is handled explicitly in `tests/setup.js` instead.
 
-The **unit** suites call the modules directly. The **e2e** suites drive the real
-route handlers over real `Request`/`NextResponse` objects, mocking *only*
-`@/lib/prisma`. That means routing, JWT verification, role checks, caching,
-rate limiting and queue dispatch all execute for real — only the database is
-stubbed, which keeps the tests fast and dependency-free.
+### Global setup — `tests/setup.js`
 
-### Notable test design decisions
+- `NODE_ENV=test`, `JWT_SECRET`, `JWT_EXPIRES_IN=1h` and a dummy `DATABASE_URL`
+  are set because `src/utils/jwt.js` throws in production without a secret and
+  `src/lib/prisma.js` skips its hot-reload global cache outside production.
+- `REDIS_URL` is **deleted** by default, so the suite exercises the documented
+  zero-infrastructure paths unless a test opts in.
+- `afterEach` calls the reset hooks through `globalThis`
+  (`__busCacheReset`, `__busRateLimitReset`, `__busRedisReset`, `delete
+  globalThis.__busQueues`) and `vi.clearAllMocks()`. They are called via
+  `globalThis` on purpose: importing `@/lib/cache` here would load
+  `@/lib/redis` → `ioredis` *before* a test file's `vi.mock('ioredis')` could
+  apply, leaving the real client wired up and the fake ignored.
 
-- **The Redis double implements the Lua scripts**, rather than stubbing
-  `eval`. A stub returning canned values would let a broken script pass; this
-  double reproduces real counter/sorted-set semantics, so the assertions are
-  meaningful.
-- **`vi.hoisted` is required** in any file with a `vi.mock` factory. Factories
-  are hoisted above the file's imports, so a factory closing over a plain
-  module-scope `const` throws `Cannot access 'x' before initialization`. Where
-  the helper itself must be loaded, the factory uses
-  `await import('../helpers/...')` instead.
-- **`setup.js` never imports application modules.** It resets state through
-  hooks the modules register on `globalThis` (`__busCacheReset`,
-  `__busRateLimitReset`, `__busRedisReset`). Importing `@/lib/cache` there would
-  load `ioredis` before a test file's `vi.mock('ioredis')` could apply, so the
-  fake would be ignored. This is the reason those hooks exist.
-- **Process-global singletons are read through `globalThis`, not captured in
-  module-level `const`s.** The Redis circuit breaker originally kept a `const`
-  reference to the object it stored on `globalThis`; once tripped it could never
-  be reset, so a single failure silently disabled Redis for the whole process —
-  and leaked across tests. `resetRedisState()` is the supported reset.
-- **The Prisma double's surface is verified against the schema.** A
-  hand-maintained mock surface drifts silently: `busPass.findFirst` was once
-  omitted, so a test died with `Cannot read properties of undefined` — the
-  *double* was wrong, not the application. `prismaMockCoverage.test.js` now
-  asserts that every `model` in `prisma/schema.prisma` exists on the mock, that
-  each model exposes the full delegate API, and that every
-  `prisma.<model>.<method>` (and `tx.<model>.<method>`) actually used in a route
-  handler is present. Adding a model or a new call without extending the double
-  fails there, with a clear message, instead of surfacing as a confusing
-  TypeError in an unrelated test.
-- **`restoreMocks` is intentionally off** in `vitest.config.mjs`: it resets mocks
-  to their original implementation, which would wipe the Prisma double's default
-  behaviour. Isolation is handled explicitly instead.
+### Helpers
 
-### Coverage focus
+| Helper | Purpose |
+| --- | --- |
+| `tests/helpers/prismaMock.js` | `createPrismaMock()` returns a Prisma-shaped double covering **every** model with the **complete** delegate surface (`findMany`, `findUnique`, `count`, `create`, `update`, `delete`, `$transaction`, …). Defaults mirror real return *shapes* — `findMany` → `[]`, `count` → `0` — because `null` would make `.filter()` throw and turn arithmetic into `NaN`. Also exports `buildUser()` and `buildAuthUser()`. |
+| `tests/helpers/fakeRedis.js` | An in-memory Redis double covering the commands the app uses (`get`, `set`, `incr`, `eval`, sorted sets, TTLs) plus `resetFakeRedis()`. |
 
-The suite targets the failure modes that actually matter in production:
-behaviour when Redis is **absent**, when it **fails mid-request**, and when it is
-**configured but unreachable** (the enqueue-timeout case, which would otherwise
-hang every write). Cache **invalidation** and **role-scoped key isolation** are
-covered end-to-end because getting either wrong is a correctness or a security
-bug, not a performance one.
+`vi.mock` factories must be **async** and import the helper inside the factory:
+`vi.mock` is hoisted above the file's imports, so referencing a module-scope
+`const` would hit a temporal-dead-zone error.
+
+### Suites
+
+**Unit** (`tests/unit/`)
+
+| File | Covers |
+| --- | --- |
+| `cache.test.js` | `withCache` miss/hit, version-bump invalidation (asserts no key sweep), `searchParamsKey` ordering, `cacheHeaders`, `cacheStatus`. |
+| `redis.test.js` | Connection management, circuit breaker tripping/reset, cache-over-Redis, Lua fixed + sliding windows reporting `source: 'redis'`. |
+| `rateLimiter.test.js` | `getClientIp`, `getRateLimitIdentity`, fixed and sliding memory fallbacks (including exact boundary behaviour and window ageing), headers, the `429` body shape, `enforceRateLimit`, policy definitions (sliding applied to abuse-sensitive endpoints, `BROADCAST < COLLECTION_WRITE`), `rateLimiterStatus`. |
+| `queue.test.js` | `runJobInline`, inline fallback with `mode: 'inline'`, distinct queue names, `getQueue`/`queueStatus` returning `null` / `configured: false` without Redis. |
+| `queueRedis.test.js` | `enqueueJob` publishing with `mode: 'queued'`, a single `Queue` instance per name, per-queue counts. |
+| `jobs.test.js` | Notification create/broadcast/emergency handlers, transaction fan-out, audit write, null-`userId` handling, required-field validation. |
+| `enqueue.test.js` | The facade wiring end-to-end with no Redis (real handlers run inline), including IP/user-agent extraction. |
+| `dates.test.js` | `startOfDay` / `endOfDay` / `startOfNextDay`, `dayRange`, `parseDateOnly`, `toLocalDateKey` — timezone-independent. |
+| `clientRateLimit.test.js` | `formatWait`, `consume`/`peek`/`guard`, `applyServerRateLimit` cooldowns, reset/clearCooldown, and that client limits stay at or below server limits. *(jsdom)* |
+| `prismaMockCoverage.test.js` | Parses `prisma/schema.prisma` and asserts the mock covers every model — so a new model cannot silently break the e2e suite. |
+
+**End-to-end / route integration** (`tests/e2e/`) — handlers are imported
+directly and driven with real `Request`/`NextResponse` objects. Nothing about
+routing, auth, caching, limiting or queueing is stubbed; only the database is.
+
+| File | Covers |
+| --- | --- |
+| `auth.login.test.js` | Valid login, `401` on wrong password, `403` for a deactivated account, rate-limit headers, blocking on the 11th attempt, no DB hit once blocked, inline audit write, password never returned. |
+| `health.test.js` | `/api/health` requires auth, is admin-only, reports `deliveryMode: 'inline'` with no Redis, exposes cache diagnostics, lists policies, ISO timestamp. |
+| `healthLive.test.js` | `/api/health/live` returns `200` with `{ status: 'ok' }`, needs no token, no Redis, no DB. |
+| `cacheRoutes.test.js` | A second identical `/api/buses` request is served from cache; a write invalidates it; **role-scoped notification cache isolation** (one role never receives another role's feed). |
+| `attendance.test.js` | Daily-summary attendance: `0` total and a `0` (not `NaN`) rate with no bookings; `isUsed: true` counts as present; the read query matches the write path's `bookingDate` window; a local-day window covering exactly one day; the report labelled with the **local** date; and the write→read round trip. |
 
 ---
 
-## Docker
 
-A single `Dockerfile` produces one image with two roles:
+## Deployment
 
-| Role | Command |
-| --- | --- |
-| Web server | *(default)* `node server.js` |
-| BullMQ worker | `npm run worker` |
+### Docker
 
-Running the worker from the **same image** guarantees the API and the worker
-execute identical code and identical job handlers — which would not hold if they
-were built separately.
-
-### Build and run
+One image serves two roles so the worker and the API always run **identical**
+code and job handlers:
 
 ```bash
 docker build -t bus-scheduling .
 
-# Web server (env comes from .env, which is never baked into the image)
+# Web server
 docker run -p 3000:3000 --env-file .env bus-scheduling
 
-# Worker (second container, same image)
+# Worker (same image, different command)
 docker run --env-file .env bus-scheduling npm run worker
 ```
 
-With a Redis instance on the host, point the container at it:
+The `Dockerfile` is a three-stage build:
 
-```bash
-docker run -p 3000:3000 --env-file .env \
-  -e REDIS_URL=redis://host.docker.internal:6379 bus-scheduling
-```
-
-### What the image does
-
-- **Multi-stage** (`deps` → `builder` → `runner`) so the slow dependency layer is
-  cached and not invalidated by source edits.
-- Uses Next.js `output: "standalone"`, so the runtime ships a minimal server plus
-  only the `node_modules` it needs, instead of the whole dependency tree.
-- Copies `bullmq`, `ioredis`, `@prisma` and `.prisma` on top of the standalone
-  bundle, because the standalone output prunes packages it thinks are unused and
-  the **worker needs them**.
-- Runs as a **non-root** user (`nextjs`, uid 1001).
-- Ships a `HEALTHCHECK` against the public `/api/health/live` endpoint (not
-  `/api/health`, which is admin-only and would return 401 to an unauthenticated
-  probe), using `127.0.0.1` rather than `localhost` to avoid resolving to `::1`
-  where the server binds IPv4 only.
-- `openssl` is installed in every stage because the Prisma query engine links
-  against it.
-
-### Prisma binary targets
-
-`prisma/schema.prisma` declares three targets:
-
-| Target | Needed by |
+| Stage | Purpose |
 | --- | --- |
-| `native` | local development |
-| `debian-openssl-3.0.x` | `node:20-bookworm-slim` (this Docker image) |
-| `rhel-openssl-3.0.x` | Vercel / Amazon Linux |
+| `deps` | `node:20-bookworm-slim` + `openssl`/`ca-certificates` (required by the Prisma query engine). Copies only the manifests + `prisma/` so the dependency layer is cached, then `npm ci` (reproducible; its `postinstall` runs `prisma generate` against a dummy `DATABASE_URL`). |
+| `builder` | Copies `node_modules` and the source, sets placeholder `DATABASE_URL`/`JWT_SECRET`, runs `npm run build`. |
+| `runner` | Non-root user `nextjs` (uid 1001). Copies `.next/standalone`, `.next/static`, `public/`, plus `worker/`, `src/lib/jobs/`, `prisma/` and `package.json`. Layers the pruned-out `bullmq`, `ioredis`, `@prisma` and `.prisma` from `deps`. |
 
-Omitting the debian target produces a container that starts and then fails at the
-first query with "Query engine binary not found".
+Details worth knowing:
 
-### Secrets
+- **No secrets are baked into image layers.** The build-time `DATABASE_URL` and
+  `JWT_SECRET` are syntactically valid placeholders used only to satisfy
+  `prisma generate` / `next build` (neither connects), and are overridden at
+  runtime via `--env-file`.
+- **The healthcheck targets `/api/health/live`, not `/api/health`.** The latter is
+  admin-only and would return `401` to an unauthenticated probe, marking a healthy
+  container permanently unhealthy. `127.0.0.1` is used instead of `localhost` to
+  avoid resolving to `::1` where the server binds IPv4 only.
+- `output: "standalone"` in `next.config.mjs` is why the container runs
+  `node server.js` rather than `next start`, and why the image does not need the
+  full dependency tree.
+- `@prisma/client`, `bcryptjs`, `ioredis` and `bullmq` are listed under
+  `experimental.serverComponentsExternalPackages` — they must be resolved at
+  runtime, not bundled (correct native query-engine binary; raw sockets/Lua/worker
+  threads for Redis).
 
-`.env` is listed in `.dockerignore`, so it is **never** copied into a layer.
-`DATABASE_URL` and `JWT_SECRET` are set to throwaway placeholders during the
-build only — `next build` needs a syntactically valid value to construct the
-Prisma client but never connects, and the real values are injected at runtime.
+### Vercel
 
-> ⚠️ `NEXT_PUBLIC_API_URL` is inlined into the **client** bundle at build time.
-> Leave it empty (the default) so the browser calls the same origin; a runtime
-> `-e` override cannot change a value that was already compiled in.
-## Getting Started
+`vercel.json` pins the build command, region and function limits:
 
-### Prerequisites
-- Node.js 18.18+ (see `engines` in `package.json`)
-- PostgreSQL database
-- npm (or yarn/pnpm)
-
-> **Important:** the app lives in the `my-app/` subfolder — run all commands from there.
-
-### Installation
-
-1. Install dependencies:
-```bash
-cd my-app
-npm install
+```json
+{
+  "framework": "nextjs",
+  "buildCommand": "prisma generate && prisma migrate deploy && next build",
+  "installCommand": "npm install",
+  "regions": ["iad1"],
+  "functions": { "src/app/api/**/route.js": { "maxDuration": 10 } }
+}
 ```
 
-2. Configure environment variables. The repo ships a working `.env`; edit the
-   values for your setup (`DATABASE_URL`, `JWT_SECRET`, optionally `REDIS_URL`):
+Set `DATABASE_URL` and `JWT_SECRET` in the project's environment variables.
+`REDIS_URL` is optional — leave it unset for the zero-infrastructure path (the
+Vercel Hobby target this repo is written for), or set it *and* deploy
+`worker/index.mjs` as a separate long-lived service (Render/Railway/Fly.io) using
+the same `REDIS_URL`. A worker cannot run inside a serverless function.
+
+The Prisma `binaryTargets` cover `native`, `debian-openssl-3.0.x` (the Docker
+image) and `rhel-openssl-3.0.x` (Vercel / Amazon Linux) so the query engine is
+present on every target.
+
+---
+
+## Operations and troubleshooting
+
+### Health checks
+
 ```bash
-# .env is already present and gitignored — no copy step needed.
-# For production, set the same keys in your host's environment.
+# Liveness (public, no dependencies)
+curl -fsS http://localhost:3000/api/health/live
+
+# Full infrastructure report (admin bearer token required)
+curl -fsS -H "Authorization: Bearer $TOKEN" http://localhost:3000/api/health
 ```
 
-3. Set up the database:
-```bash
-npx prisma generate
-npx prisma db push        # or: npx prisma migrate deploy
-```
+### Diagnosing common problems
 
-4. Run the development server:
-```bash
-npm run dev
-```
-
-5. Open [http://localhost:3000](http://localhost:3000)
-
-6. *(Optional)* Enable Redis, caching and the job queue:
-```bash
-docker run -d --name bus-redis -p 6379:6379 redis:7-alpine
-# set REDIS_URL="redis://localhost:6379" in .env, then in a second terminal:
-npm run worker
-```
-
-## Environment Variables
-
-| Key | Required | Description |
+| Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| `DATABASE_URL` | Yes | PostgreSQL connection string. Use a hosted DB on Vercel; append `?pgbouncer=true&connection_limit=1` for pooled serverless connections. |
-| `JWT_SECRET` | Yes (prod) | Long random string (`openssl rand -base64 32`). The app throws in production without it. |
-| `JWT_EXPIRES_IN` | No | Token lifetime, e.g. `7d` (default `7d`). |
-| `NEXT_PUBLIC_API_URL` | No | Leave **empty** so browser requests use the same origin. Set only for an external API host. |
-| `REDIS_URL` | No | Redis connection string, e.g. `redis://localhost:6379`. **Leave empty to disable Redis entirely** — caching and rate limiting fall back to per-process memory and jobs run inline. Set it to enable the shared cache, distributed rate limits and the BullMQ worker. |
-| `CACHE_TTL_SECONDS` | No | Default cache TTL when a namespace has no specific TTL (default `60`). |
-| `CACHE_MEMORY_MAX_ENTRIES` | No | Max entries in the in-process cache fallback before eviction (default `500`). |
-| `REDIS_DEBUG` | No | `"true"` logs Redis connection/command failures to the console (default `false`). |
-| `RATE_LIMIT_LOG` | No | Reserved for rate-limit logging verbosity (default `warn`). |
+| `JWT_SECRET is not set` on the first request in production | Missing env var | Set `JWT_SECRET` in the platform's environment variables. It is resolved lazily on purpose, so the build succeeds and the failure is explicit. |
+| `prisma generate` fails during install/build | `DATABASE_URL` absent or malformed | Provide a syntactically valid connection string; no connection is made at build time. |
+| Notifications/audit rows never appear | `REDIS_URL` set but no worker running | Run `npm run worker`, or unset `REDIS_URL` to use inline execution. Check `queue.deliveryMode` and `queue.pendingJobs` on `/api/health`. |
+| Mutating requests hang, then succeed slowly | Redis reachable but unresponsive | BullMQ requires `maxRetriesPerRequest: null`, so the enqueue timeout (`QUEUE_ENQUEUE_TIMEOUT_MS`) is what protects you. Confirm the circuit breaker is tripping (`REDIS_DEBUG=true` to log it). |
+| Attendance shows `0%` right after verifying passes | Stale report cache | Should not occur — `/api/buspass` PUT invalidates `REPORTS` + `DASHBOARD`. If you add a new write path that changes attendance, invalidate `REPORTS`. |
+| A new field never appears in a list response | Cached namespace not invalidated | Add the namespace to the `invalidate(...)` call in the mutating handler. |
+| A passenger sees an admin's notifications | Role missing from the cache key | The notifications route keys on `${user.role}:${searchParamsKey(req)}` — keep that property when touching the route. |
+| Camera scanner does nothing | Insecure context | Camera access requires HTTPS or `localhost`. The component surfaces an explicit message. |
+| `401` loop / immediately redirected to `/login` | Expired or invalid token | Expected. The axios response interceptor clears storage and redirects. Sign in again. |
+| Docker container reports unhealthy | Healthcheck pointing at `/api/health` | Use `/api/health/live` (already the default). |
 
-## Available Scripts
+### Operational notes
 
-| Script | Description |
-| --- | --- |
-| `npm run dev` | Start the development server |
-| `npm run worker` | Start the BullMQ worker (`node worker/index.mjs`) — requires `REDIS_URL` |
-| `npm test` | Run the full Vitest suite (unit + e2e) |
-| `npm run test:watch` | Vitest in watch mode |
-| `npm run test:unit` | Unit suites only (`tests/unit`) |
-| `npm run test:e2e` | End-to-end route suites only (`tests/e2e`) |
-| `npm run test:coverage` | Vitest with v8 coverage → `./coverage` |
-| `npm run build` | `prisma generate && next build` |
-| `npm run start` | Start the production server |
-| `npm run lint` | Run ESLint (`next lint`) |
-| `npm run vercel-build` | Build with `prisma migrate deploy` (used by `vercel.json`) |
-| `npm run prisma:generate` | Generate the Prisma client |
-| `npm run prisma:push` | Push the schema to the database (no migration history) |
-| `npm run prisma:migrate` | Apply pending migrations (`prisma migrate deploy`) |
-| `npm run prisma:studio` | Open Prisma Studio |
+- **Audit-trail growth.** `ActivityLog` grows without bound; `/api/activity-logs`
+  clamps `limit` to 100 and is rate-limited separately. Plan retention pruning for
+  long-lived deployments.
+- **Cache flush semantics.** `invalidate` only bumps a version counter, so
+  orphaned Redis entries linger until their TTL expires. This is by design (no
+  `SCAN`), but memory is reclaimed lazily, not immediately.
+- **In-memory cache bounds.** `CACHE_MEMORY_MAX_ENTRIES` (default 500) caps the
+  fallback store with FIFO eviction. Raise it for a single-instance deployment
+  where you want a larger hot set.
+- **Multiple instances without Redis** each keep independent cache, limiter and
+  queue state. Configure `REDIS_URL` for consistent behaviour across replicas.
 
-## Deploying to Vercel (Free Tier)
+---
 
-This project is preconfigured to run on the Vercel Hobby (free) plan.
+## Coding conventions
 
-### 1. Push to a Git repository
-Commit the project (including `prisma/migrations/`) to GitHub/GitLab/Bitbucket.
+### Imports and aliases
 
-### 2. Import the project in Vercel
-Import the repository and set the **Root Directory** to `my-app` (the app lives in a subfolder). Vercel auto-detects the Next.js framework; `vercel.json` sets the build command to:
+`@/*` maps to `./src/*` (`jsconfig.json`, mirrored in `vitest.config.mjs`):
 
-```
-prisma generate && prisma migrate deploy && next build
+```js
+import prisma from '@/lib/prisma';
+import { authMiddleware } from '@/middleware/auth';
+import { Button } from '@/components/ui';           // barrel export
+import { bookingService } from '@/services/bookingService';
+import { startOfDay, startOfNextDay } from '@/utils/dates';
 ```
 
-### 3. Add environment variables
-In **Project → Settings → Environment Variables**, add (for Production, Preview and Development):
+### Adding an API endpoint
 
-| Key | Value |
-| --- | --- |
-| `DATABASE_URL` | A **hosted** Postgres URL (Neon, Supabase, Vercel Postgres, etc.). For pooled connections append `?pgbouncer=true&connection_limit=1`. |
-| `JWT_SECRET` | A long random string, e.g. output of `openssl rand -base64 32`. **Required** — the app refuses to sign tokens in production without it. |
-| `JWT_EXPIRES_IN` | Optional, e.g. `7d`. |
-| `NEXT_PUBLIC_API_URL` | Leave **empty** so the browser calls the same origin. |
-| `REDIS_URL` | Optional. Leave **unset** to run without Redis (in-memory cache/limits, inline jobs). Set it to enable the shared cache and distributed rate limits — but see the worker note below. |
+1. Create `src/app/api/<resource>/route.js` (and `[id]/route.js` if needed).
+2. Start the file with `export const runtime = 'nodejs';` and
+   `export const dynamic = 'force-dynamic';`.
+3. Order the handler as: `authMiddleware` → `enforceRateLimit` → `withCache`
+   (reads) → Prisma → `invalidate(...)` → side effects (`logActivity`,
+   `enqueue*`).
+4. Guard the auth result with
+   `if (authResult instanceof NextResponse) return authResult;`.
+5. Wrap the body in `try/catch`, `console.error` the failure and return a `500`
+   with a user-safe `{ error: '…' }`.
+6. Return `NextResponse.json(data, { headers: cacheHeaders(result) })` for cached
+   reads.
+7. Add a matching method to `src/services/<resource>Service.js` so the UI never
+   calls `fetch` directly.
 
-> ⚠️ The default `DATABASE_URL` in `.env` points at `localhost` and will **not** work on Vercel. Always use a hosted database in production.
+### Adding a client page
 
-> ⚠️ **If you set `REDIS_URL` on Vercel, run the worker too.** Serverless
-> functions cannot host a long-lived BullMQ worker, so notifications and audit
-> logs would queue up and never be written. Either deploy `worker/index.mjs` as a
-> separate long-lived service (Render/Railway/Fly.io — the `Dockerfile` in this
-> repo works as-is) or leave `REDIS_URL` unset, in which case jobs execute inline
-> and everything still works. Check `GET /api/health` for
-> `queue.deliveryMode` and `queue.pendingJobs`.
+1. Create `src/app/<path>/page.js` starting with `'use client';`.
+2. Wrap content in `<DashboardLayout>` (it handles the auth redirect and the
+   loading state) and use `useAuth()` / `useApp()` for state.
+3. Build the UI from `@/components/ui` primitives (`Card`, `Button`, `Input`,
+   `Select`, `Modal`, `Badge`, `Alert`, `LoadingSpinner`) and Feather icons from
+   `react-icons/fi`.
+4. Add the route to the appropriate link array in
+   `src/components/layout/Sidebar.js` (`adminLinks`, `driverLinks`,
+   `passengerLinks`).
+5. Style with Tailwind utilities and the dark slate palette; the app is
+   dark-mode-only by design.
 
-### 4. Deploy
-Vercel runs `prisma generate`, applies pending migrations (`prisma migrate deploy`) and builds. The build is statically lint-checked with `.eslintrc.json` (non-interactive).
+### Adding a background job
 
-### Free-tier notes
-- All API routes use `runtime = 'nodejs'` and `dynamic = 'force-dynamic'`, so no response is cached and the Node runtime (required by Prisma/bcrypt/jsonwebtoken) is always used.
-- Function `maxDuration` is capped at 10s in `vercel.json` to stay within Hobby limits.
-- Prisma client generation happens automatically via the `postinstall` script and the build command.
-- `socket.io` server usage is not supported on serverless functions and has been removed; real-time behaviour is achieved via polling (`/tracking` auto-refreshes every 30s).
+1. Add the job name to `JOB_NAMES` in `src/lib/queue.js` (and to the `*_JOBS` map
+   in the handler module).
+2. Implement the handler in `src/lib/jobs/<domain>.jobs.mjs` — **no imports**,
+   take `{ prisma, data }` as arguments, and validate required fields by throwing.
+3. Register it in that module's `default` export map.
+4. Add an `enqueue*` helper to `src/lib/enqueue.js` that passes
+   `{ handlers, ctx: { prisma } }` so the inline fallback works.
+5. Call the helper from the route; never touch the queue directly.
 
-## Troubleshooting
+### Style rules used throughout
 
-- **`JWT_SECRET is not set` in production** — add `JWT_SECRET` to your host's
-  environment variables.
-- **Styles are missing / the page looks unstyled** — Tailwind v4 is compiled
-  through PostCSS via `postcss.config.mjs`. Ensure that file exists and that
-  `@tailwindcss/postcss` is installed; the stylesheet is imported in
-  `src/app/globals.css` with `@import "tailwindcss";`.
-- **`Query engine not found` / Prisma errors on deploy** — ensure the build runs
-  `prisma generate` (the `postinstall` and `build` scripts handle this) and that
-  `binaryTargets` includes your host's target (already set to
-  `["native", "rhel-openssl-3.0.x"]` for Vercel).
-- **Requests fail with 401 after a while** — the JWT expired; the client clears
-  the stale session and redirects to `/login`.
-- **`Cannot modify stops that have existing bookings`** — a route's stops cannot
-  be replaced once bookings reference them; deactivate the route instead.
-- **`No seats available for this trip`** — capacity was reached; seat allocation
-  is transactional, so concurrent bookings cannot overbook.
-- **QR scanner shows "Camera is not available"** — the browser blocks camera
-  access on insecure origins. Use `https://` (e.g. on Vercel) or `http://localhost`;
-  plain `http://` on a LAN IP will not work. The scanner also needs permission
-  granted and no other app holding the camera.
+- 2-space indent, single quotes in most files (a few older routes use double —
+  match the surrounding file), semicolons, trailing commas.
+- Every non-obvious decision is explained in a comment stating the *why*
+  (a failure mode that was hit), not the *what*.
+- Module-level singletons (`prisma`, Redis clients, cache maps, rate-limit
+  buckets, queue registry) are attached to `globalThis` so hot reloads and
+  serverless invocations reuse them instead of leaking one per request.
+- Reset hooks are exposed on `globalThis` (`__busCacheReset`,
+  `__busRateLimitReset`, `__busRedisReset`) so tests can clear module state
+  **without importing** the module (which would pull in `ioredis` before a
+  `vi.mock` could apply).
+- Dates that mean "a calendar day" go through `src/utils/dates.js`; never mix
+  `new Date(dateString)` with `setHours`.
+- Errors returned to clients are generic (`'Failed to fetch buses'`); details go
+  to `console.error` only.
+
+---
 
 ## License
 
-MIT License
+No `LICENSE` file is present in this repository. Add one before distributing or
+deploying publicly, and update this section accordingly.
