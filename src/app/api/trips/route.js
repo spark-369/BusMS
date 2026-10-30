@@ -136,8 +136,6 @@ export async function POST(req) {
       );
     }
 
-    console.log(schedule);
-
     const selectedRoute = schedule.route;
     const selectedBus = schedule.bus;
     const routeId = selectedRoute.id;

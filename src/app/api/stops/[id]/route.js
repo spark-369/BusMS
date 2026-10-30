@@ -116,6 +116,12 @@ export async function PUT(req, { params }) {
       },
     });
 
+    // A stop edit changes the stop list AND the route detail (which embeds its
+    // stops). The DELETE handler below already flushed both namespaces; without
+    // this the 60s STOPS entry survived the write, so the stops list and the
+    // stop detail kept serving pre-edit data for up to a minute.
+    await invalidate(CACHE_NAMESPACES.STOPS, CACHE_NAMESPACES.ROUTES);
+
     return NextResponse.json({
       message: 'Stop updated successfully',
       stop,

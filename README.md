@@ -381,12 +381,12 @@ my-app/
 │   │        activityLog,assignment}Service.js
 │   └── utils/{jwt,dates,clientRateLimit}.js
 ├── tests/
-│   ├── setup.js                      # Global env + reset hooks
-│   ├── helpers/{prismaMock,fakeRedis}.js
+│   ├── setup.js                      # Global env, console silencers, reset hooks
+│   ├── helpers/{prismaMock,fakeRedis,routeHarness}.js
 │   ├── unit/                         # cache, queue, redis, rateLimiter, dates,
 │   │                                 # jobs, enqueue, clientRateLimit, coverage
-│   └── e2e/                          # health, healthLive, auth.login,
-│                                     # cacheRoutes, attendance
+│   └── e2e/                          # one suite per API resource + auth, health,
+│                                     # cacheRoutes, attendance (see Testing)
 ├── worker/index.mjs                  # Standalone BullMQ worker
 ├── Dockerfile                        # 3-stage build (deps → builder → runner)
 ├── vercel.json                       # Build command, region, function limits
@@ -550,7 +550,7 @@ Cached reads carry `X-Cache: HIT|MISS` and, on a hit, `X-Cache-Source`.
 
 | Method | Path | Roles | Notes |
 | --- | --- | --- | --- |
-| `GET` | `/api/buses` | all | Cached (`buses`, TTL 30 s). Query: `status`, `search`. |
+| `GET` | `/api/buses` | all | Cached (`buses`, TTL 30 s). Query: `status`. |
 | `POST` | `/api/buses` | `ADMIN` | Body: `{ busNumber, plateNumber, capacity, model?, year?, fuelType?, mileage? }`. |
 | `GET` | `/api/buses/:id` | all | Cached by `id:<id>`; includes driver, schedules, maintenance. |
 | `PUT` | `/api/buses/:id` | `ADMIN` | Partial update; invalidates `BUSES`, `DASHBOARD`. |
@@ -589,7 +589,7 @@ Cached reads carry `X-Cache: HIT|MISS` and, on a hit, `X-Cache-Source`.
 
 | Method | Path | Roles | Notes |
 | --- | --- | --- | --- |
-| `GET` | `/api/bookings` | all | Admins see all; passengers/drivers see their own. Query: `tripId`, `status`, date. |
+| `GET` | `/api/bookings` | all | Passengers are **always** scoped to their own rows (`where.userId = user.id`); admins and drivers see every booking and may narrow with `userId`. Query: `status`, `bookingDate` (local-day window), `userId`, `busId`, `isUsed`. |
 | `POST` | `/api/bookings` | `ADMIN`, `PASSENGER` | Body: `{ tripId, stopId, bookingDate }`. Uses the stricter `BOOKING_WRITE` policy. `bookingDate` is parsed as **local** midnight. Rejects a stop that does not belong to the trip's route (`400`) and a duplicate active booking for the same trip/day (`409`). Seat allocation + insert run in a **`Serializable`** transaction; a full bus raises `NO_SEATS` → `400 "No seats available for this trip"`. Seat labels are generated as `1A…1D, 2A…`. Generates a QR data URL and notifies drivers (`BOOKING_CONFIRMATION`). |
 | `GET` | `/api/bookings/:id` | all | |
 | `PUT` | `/api/bookings/:id` | `ADMIN`, `PASSENGER` | A passenger may only modify **their own** booking and may only set `status: "CANCELLED"` (`403` otherwise). Invalidates `REPORTS` + `DASHBOARD`. |
@@ -917,6 +917,17 @@ npm run test:coverage  # + HTML/lcov report in ./coverage
 The suite runs with **no database and no Redis**. It is designed so that
 importing an application module cannot fail or reach a real service.
 
+There are two groups:
+
+- **Unit** (`tests/unit/`) — the infrastructure libraries (cache, Redis, rate
+  limiter, queue, job handlers, date helpers, client-side limiter) in isolation.
+- **End-to-end** (`tests/e2e/`) — one suite per API resource, plus auth, health,
+  cache behaviour and the attendance round trip. Handlers are imported directly
+  and driven with real `Request`/`NextResponse` objects; only Prisma is doubled.
+
+Both groups share the same `setupFiles`, so console output is silenced and the
+`globalThis` singletons are reset between tests (see below).
+
 ### Configuration — `vitest.config.mjs`
 
 | Setting | Value | Why |
@@ -941,6 +952,12 @@ Isolation is handled explicitly in `tests/setup.js` instead.
   `src/lib/prisma.js` skips its hot-reload global cache outside production.
 - `REDIS_URL` is **deleted** by default, so the suite exercises the documented
   zero-infrastructure paths unless a test opts in.
+- `console.error`, `console.warn` and `console.log` are stubbed at module scope.
+  Many suites deliberately drive a handler into its `catch` block (a rejected
+  Prisma call) to assert the `500` path; the handler's own log line would
+  otherwise flood the report with `stderr` blocks that look like failures but are
+  the expected output of a *passing* test. Only the implementation is stubbed, so
+  a test can still assert on `console.error.mock.calls` if it needs to.
 - `afterEach` calls the reset hooks through `globalThis`
   (`__busCacheReset`, `__busRateLimitReset`, `__busRedisReset`, `delete
   globalThis.__busQueues`) and `vi.clearAllMocks()`. They are called via
@@ -954,6 +971,7 @@ Isolation is handled explicitly in `tests/setup.js` instead.
 | --- | --- |
 | `tests/helpers/prismaMock.js` | `createPrismaMock()` returns a Prisma-shaped double covering **every** model with the **complete** delegate surface (`findMany`, `findUnique`, `count`, `create`, `update`, `delete`, `$transaction`, …). Defaults mirror real return *shapes* — `findMany` → `[]`, `count` → `0` — because `null` would make `.filter()` throw and turn arithmetic into `NaN`. Also exports `buildUser()` and `buildAuthUser()`. |
 | `tests/helpers/fakeRedis.js` | An in-memory Redis double covering the commands the app uses (`get`, `set`, `incr`, `eval`, sorted sets, TTLs) plus `resetFakeRedis()`. |
+| `tests/helpers/routeHarness.js` | Scaffolding shared by the route-handler suites: `apiRequest()` (real `Request` with a signed bearer token + `x-forwarded-for`), `params()` (the `{ params: { id } }` second argument), `actAs()` / `mockUserLookups()` (the auth-middleware `findUnique` double, keyed by id *or* email), `primeSideEffects()` (resolves the inline audit/notification writes), plus `adminUser()` / `driverUser()` / `passengerUser()` and per-model entity fixtures. |
 
 `vi.mock` factories must be **async** and import the helper inside the factory:
 `vi.mock` is hoisted above the file's imports, so referencing a module-scope
@@ -987,6 +1005,23 @@ routing, auth, caching, limiting or queueing is stubbed; only the database is.
 | `healthLive.test.js` | `/api/health/live` returns `200` with `{ status: 'ok' }`, needs no token, no Redis, no DB. |
 | `cacheRoutes.test.js` | A second identical `/api/buses` request is served from cache; a write invalidates it; **role-scoped notification cache isolation** (one role never receives another role's feed). |
 | `attendance.test.js` | Daily-summary attendance: `0` total and a `0` (not `NaN`) rate with no bookings; `isUsed: true` counts as present; the read query matches the write path's `bookingDate` window; a local-day window covering exactly one day; the report labelled with the **local** date; and the write→read round trip. |
+| `auth.register.test.js` | Public sign-up: required fields, email/password shape, the **`ADMIN` privilege-escalation block**, role-specific required fields, duplicate email, hashing, rate-limit headers, the 429 on the 6th attempt, and a 500 on a database error. |
+| `auth.me.test.js` | Session probe: no/invalid token → `401`, unknown user → `401`, deactivated account → `403`, and the resolved user for any role (password never returned). |
+| `buses.test.js` / `busById.test.js` | Bus CRUD: cache hit/miss + query-string keying, admin-only writes, required/positive-capacity validation, duplicate detection, numeric coercion, audit + cache invalidation, `404`/`500`, and the active-schedule delete guard. |
+| `routes.test.js` / `routeById.test.js` | Route CRUD: nested stop creation and ordering, `isActive` filtering, admin-only writes, the **transactional stop replacement**, the `409` when bookings reference those stops, and the soft-delete (`isActive: false`). |
+| `stops.test.js` / `stopById.test.js` | Stop CRUD: route filtering, ordered reads, coordinate range validation, route-existence check, auto-incrementing `order`, the delete→deactivate fallback when bookings reference the stop, and a regression guard that `PUT` flushes both `STOPS` and `ROUTES`. |
+| `schedules.test.js` / `scheduleById.test.js` | Schedule CRUD: every query filter, time-only→`Date` conversion, enum fallback to `MORNING`, route/bus existence checks, passenger notification, and the soft-delete. |
+| `trips.test.js` / `tripById.test.js` | Trip CRUD: single-day date window, schedule-derived route/bus/driver, status transition rules (terminal states, driver ownership), completion timestamps, and the in-progress delete guard. |
+| `bookings.test.js` / `bookingById.test.js` | Bookings: passenger rows scoped to the caller, local-day duplicate check, seat allocation inside a `Serializable` transaction, `NO_SEATS`, QR generation, and passenger-only cancel/ownership rules. |
+| `users.test.js` / `userById.test.js` | User directory and profiles: admin-only listing with an explicit `select` (no password), the id-vs-email `findUnique` discrimination, bcrypt hashing, profile ownership rules, and the soft-delete. |
+| `notifications.test.js` | Full notification CRUD: role-scoped feeds and unread counts, per-role cache isolation, admin-only send, type validation, the 3-role broadcast fan-out, role-scoped mark-read/delete, and cleanup of read rows. |
+| `buspass.test.js` | Bus passes: passenger self-scoping, issuance rules (role check, date range, one active pass), QR verification → attendance marking, and admin `PATCH`/`DELETE`. |
+| `maintenance.test.js` | Maintenance register: admin-only reads, type/date validation, bus status flip to `MAINTENANCE` on repair/breakdown, completion returning the bus to `ACTIVE`, and deletion. |
+| `reports.test.js` | Report types: default overview, `bus-usage`, `fuel-consumption` (incl. the 0-denominator guard), `driver-performance`, per-type cache keys, and admin-only access. |
+| `dashboard.test.js` | Dashboard aggregates, active-driver scoping, 30 s caching, and the emergency broadcast (admin-only, message required, 3-role fan-out, `BROADCAST` rate cap, audit entry). |
+| `feedback.test.js` | Feedback: passenger self-scoping, rating bounds, trip existence, duplicate-per-trip rejection, average-rating maths (incl. the empty case), and admin notification. |
+| `activityLogs.test.js` | Audit trail: admin-only, user/action/date filters, pagination defaults, skip/take derivation, and **pagination sanitization** (negative page, oversized limit, non-numeric input). |
+| `assignments.test.js` | Driver assignments: bus/driver/derived stats, status + search filters, and the full assign/unassign guard chain (non-driver, deactivated, already-assigned, already-taken bus). |
 
 ---
 
